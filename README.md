@@ -19,7 +19,7 @@
 
 > **Status:** Odyssey is under active development and should be treated as pre-production software.
 
-Odyssey is an open-source, bundle-first agent runtime written in Rust. It lets you define an agent once, package it as a portable artifact, and run it through the same execution model across local development, embedded SDK usage, shared runtime servers, and terminal workflows.
+Odyssey is an open-source, bundle-first agent runtime written in Rust on top of [AutoAgents](https://github.com/liquidos-ai/AutoAgents) - Agent Framework in Rust. It lets you define an agent once, package it as a portable artifact, and run it through the same execution model across local development, embedded SDK usage, shared runtime servers, and terminal workflows.
 
 The project is built around a simple idea:
 
