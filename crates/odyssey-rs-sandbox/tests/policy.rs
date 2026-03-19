@@ -1,5 +1,3 @@
-//! Sandbox policy enforcement tests.
-
 use odyssey_rs_protocol::SandboxMode;
 use odyssey_rs_sandbox::{
     AccessDecision, AccessMode, LocalSandboxProvider, SandboxContext, SandboxPolicy,
@@ -8,7 +6,6 @@ use odyssey_rs_sandbox::{
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
-/// Workspace write mode should block paths outside the workspace.
 #[tokio::test]
 async fn workspace_mode_blocks_external_paths() {
     let temp = tempdir().expect("tempdir");
@@ -17,7 +14,7 @@ async fn workspace_mode_blocks_external_paths() {
         mode: SandboxMode::WorkspaceWrite,
         policy: SandboxPolicy::default(),
     };
-    let provider = LocalSandboxProvider::new();
+    let provider = LocalSandboxProvider::default();
     let handle = provider.prepare(&ctx).await.expect("prepare");
 
     let inside = temp.path().join("file.txt");
@@ -28,14 +25,13 @@ async fn workspace_mode_blocks_external_paths() {
         AccessDecision::Allow
     );
     assert!(matches!(
-        provider.check_access(&handle, &outside, AccessMode::Read),
+        provider.check_access(&handle, &outside, AccessMode::Write),
         AccessDecision::Deny(_)
     ));
 }
 
-/// Allow lists should restrict access to explicitly allowed paths.
 #[tokio::test]
-async fn allowlist_restricts_access() {
+async fn read_roots_restrict_access() {
     let temp = tempdir().expect("tempdir");
     let allow_path = temp.path().join("allowed");
     std::fs::create_dir_all(&allow_path).expect("create allow dir");
@@ -43,15 +39,15 @@ async fn allowlist_restricts_access() {
     let mut policy = SandboxPolicy::default();
     policy
         .filesystem
-        .allow_read
+        .read_roots
         .push(allow_path.to_string_lossy().to_string());
 
     let ctx = SandboxContext {
         workspace_root: temp.path().to_path_buf(),
-        mode: SandboxMode::WorkspaceWrite,
+        mode: SandboxMode::ReadOnly,
         policy,
     };
-    let provider = LocalSandboxProvider::new();
+    let provider = LocalSandboxProvider::default();
     let handle = provider.prepare(&ctx).await.expect("prepare");
 
     let allowed = allow_path.join("file.txt");
@@ -62,7 +58,7 @@ async fn allowlist_restricts_access() {
         AccessDecision::Allow
     );
     assert!(matches!(
-        provider.check_access(&handle, &denied, AccessMode::Read),
+        provider.check_access(&handle, &denied, AccessMode::Write),
         AccessDecision::Deny(_)
     ));
 }

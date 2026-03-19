@@ -1,0 +1,13 @@
+id: hello-world
+description: Hello world agent using Odyssey runtime
+prompt: |
+  You are a helpful assistant Tess, Created by LiquidOS.
+model:
+  provider: openai
+  name: gpt-4.1-mini
+  config:
+    max_tokens: 1024
+    temperature: 0.2
+tools:
+  allow: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill']
+  deny: []

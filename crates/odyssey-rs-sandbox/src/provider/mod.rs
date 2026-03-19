@@ -1,47 +1,46 @@
-//! Sandbox provider traits and shared helpers.
-
 use async_trait::async_trait;
-use log::{debug, info, warn};
-use std::collections::BTreeMap;
+use log::info;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::error::SandboxError;
 use crate::types::{
-    AccessDecision, AccessMode, CommandResult, CommandSpec, SandboxContext, SandboxHandle,
-    SandboxLimits, SandboxNetworkMode, SandboxPolicy,
+    AccessDecision, AccessMode, CommandLandlockPolicy, CommandResult, CommandSpec, SandboxContext,
+    SandboxHandle, SandboxLimits, SandboxNetworkMode, SandboxPolicy,
 };
 use odyssey_rs_protocol::SandboxMode;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-// pub mod noop;
 pub mod local;
+pub mod noop;
 
-/// Report of missing dependencies for a sandbox provider.
-#[derive(Debug, Default)]
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_WALL_CLOCK_SECONDS: u64 = 60;
+const DEFAULT_STDIO_BYTES: usize = 64 * 1024;
+const SAFE_ENV_VARS: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"];
+const LANDLOCK_HELPER_ENV: &str = "ODYSSEY_SANDBOX_INTERNAL_LANDLOCK_HELPER";
+const LANDLOCK_HELPER_NAME: &str = "odyssey-rs-sandbox-internal-landlock-helper";
+
+#[derive(Debug, Default, Clone)]
 pub struct DependencyReport {
-    /// Hard errors preventing provider use.
     pub errors: Vec<String>,
-    /// Warnings that may degrade functionality.
     pub warnings: Vec<String>,
 }
 
-/// Sandbox provider interface.
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
-    /// Prepare a sandbox for execution.
     async fn prepare(&self, ctx: &SandboxContext) -> Result<SandboxHandle, SandboxError>;
 
-    /// Run a command in the sandbox, capturing output.
     async fn run_command(
         &self,
         handle: &SandboxHandle,
         spec: CommandSpec,
     ) -> Result<CommandResult, SandboxError>;
 
-    /// Run a command in the sandbox with streaming output.
     async fn run_command_streaming(
         &self,
         handle: &SandboxHandle,
@@ -49,121 +48,132 @@ pub trait SandboxProvider: Send + Sync {
         sink: &mut dyn CommandOutputSink,
     ) -> Result<CommandResult, SandboxError>;
 
-    /// Check access to a path within the sandbox.
     fn check_access(&self, handle: &SandboxHandle, path: &Path, mode: AccessMode)
     -> AccessDecision;
 
-    /// Return a dependency report for the provider.
+    fn spawn_command(
+        &self,
+        _handle: &SandboxHandle,
+        _spec: CommandSpec,
+    ) -> Result<Command, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "sandbox backend does not support long-lived protocol transports".to_string(),
+        ))
+    }
+
     fn dependency_report(&self) -> DependencyReport {
         DependencyReport::default()
     }
 
-    /// Shutdown and release sandbox resources.
     async fn shutdown(&self, handle: SandboxHandle);
 }
 
-/// Streaming output sink for sandboxed commands.
 pub trait CommandOutputSink: Send {
-    /// Handle stdout chunk.
     fn stdout(&mut self, chunk: &str);
-    /// Handle stderr chunk.
     fn stderr(&mut self, chunk: &str);
 }
 
-/// Mount specification for sandbox environments.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Mount {
-    /// Source path on the host.
-    source: PathBuf,
-    /// Target path inside the sandbox.
-    target: PathBuf,
-    /// Whether the mount is writable.
-    writable: bool,
+    pub(crate) source: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) writable: bool,
 }
 
-/// Fully prepared sandbox execution plan.
 #[derive(Debug, Clone)]
 pub struct PreparedSandbox {
-    /// Access policy derived from config.
-    access: AccessPolicy,
-    /// Environment variables to inject.
-    env: BTreeMap<String, String>,
-    /// Resource limits.
-    #[allow(dead_code)]
-    limits: SandboxLimits,
-    /// Network policy.
-    #[allow(dead_code)]
-    network: SandboxNetworkMode,
-    /// Default working directory.
-    working_dir: PathBuf,
-    /// Mount list for the sandbox.
-    #[allow(dead_code)]
-    mounts: Vec<Mount>,
+    pub(crate) access: AccessPolicy,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) allowed_env_keys: BTreeSet<String>,
+    pub(crate) limits: SandboxLimits,
+    pub(crate) network: SandboxNetworkMode,
+    pub(crate) working_dir: PathBuf,
+    pub(crate) mounts: Vec<Mount>,
 }
 
-/// Default access scope for paths without explicit rules.
-#[derive(Debug, Clone, Copy)]
-enum DefaultScope {
-    None,
-    WorkspaceOnly,
-    All,
-}
-
-/// Allow/deny rules for a specific access mode.
 #[derive(Debug, Clone)]
 struct AccessRules {
-    allow: Vec<PathBuf>,
-    deny: Vec<PathBuf>,
-    default_scope: DefaultScope,
+    roots: Vec<PathBuf>,
+    allow_all: bool,
 }
 
-/// Aggregated access policy for read/write/exec.
 #[derive(Debug, Clone)]
-struct AccessPolicy {
-    workspace_root: PathBuf,
+pub(crate) struct AccessPolicy {
+    pub(crate) workspace_root: PathBuf,
     read: AccessRules,
     write: AccessRules,
     exec: AccessRules,
 }
 
 impl AccessPolicy {
-    /// Build access policy from sandbox mode and config.
     fn new(
         mode: SandboxMode,
         policy: &SandboxPolicy,
         workspace_root: &Path,
     ) -> Result<Self, SandboxError> {
-        let workspace_root = normalize_path(workspace_root);
-        let default_read = match mode {
-            SandboxMode::ReadOnly | SandboxMode::WorkspaceWrite => DefaultScope::WorkspaceOnly,
-            SandboxMode::DangerFullAccess => DefaultScope::All,
+        let workspace_root = canonicalize_existing_path(workspace_root)?;
+        let system_roots = system_runtime_roots();
+
+        let read = match mode {
+            SandboxMode::DangerFullAccess => AccessRules {
+                roots: Vec::new(),
+                allow_all: true,
+            },
+            SandboxMode::ReadOnly | SandboxMode::WorkspaceWrite => {
+                let mut roots = vec![workspace_root.clone()];
+                roots.extend(system_roots.iter().cloned());
+                roots.extend(normalize_existing_roots(
+                    &workspace_root,
+                    &policy.filesystem.read_roots,
+                )?);
+                AccessRules {
+                    roots: dedupe_roots(roots),
+                    allow_all: false,
+                }
+            }
         };
-        let default_write = match mode {
-            SandboxMode::ReadOnly => DefaultScope::None,
-            SandboxMode::WorkspaceWrite => DefaultScope::WorkspaceOnly,
-            SandboxMode::DangerFullAccess => DefaultScope::All,
+
+        let write = match mode {
+            SandboxMode::DangerFullAccess => AccessRules {
+                roots: Vec::new(),
+                allow_all: true,
+            },
+            SandboxMode::ReadOnly => AccessRules {
+                roots: normalize_existing_roots(&workspace_root, &policy.filesystem.write_roots)?,
+                allow_all: false,
+            },
+            SandboxMode::WorkspaceWrite => {
+                let mut roots = vec![workspace_root.clone()];
+                roots.extend(normalize_existing_roots(
+                    &workspace_root,
+                    &policy.filesystem.write_roots,
+                )?);
+                AccessRules {
+                    roots: dedupe_roots(roots),
+                    allow_all: false,
+                }
+            }
         };
-        let default_exec = match mode {
-            SandboxMode::ReadOnly => DefaultScope::None,
-            SandboxMode::WorkspaceWrite => DefaultScope::WorkspaceOnly,
-            SandboxMode::DangerFullAccess => DefaultScope::All,
+
+        let exec = match mode {
+            SandboxMode::DangerFullAccess => AccessRules {
+                roots: Vec::new(),
+                allow_all: true,
+            },
+            SandboxMode::ReadOnly | SandboxMode::WorkspaceWrite => {
+                let mut roots = system_roots;
+                roots.push(workspace_root.clone());
+                roots.extend(normalize_existing_roots(
+                    &workspace_root,
+                    &policy.filesystem.exec_roots,
+                )?);
+                AccessRules {
+                    roots: dedupe_roots(roots),
+                    allow_all: false,
+                }
+            }
         };
-        let read = AccessRules {
-            allow: normalize_patterns(&workspace_root, &policy.filesystem.allow_read)?,
-            deny: normalize_patterns(&workspace_root, &policy.filesystem.deny_read)?,
-            default_scope: default_read,
-        };
-        let write = AccessRules {
-            allow: normalize_patterns(&workspace_root, &policy.filesystem.allow_write)?,
-            deny: normalize_patterns(&workspace_root, &policy.filesystem.deny_write)?,
-            default_scope: default_write,
-        };
-        let exec = AccessRules {
-            allow: normalize_patterns(&workspace_root, &policy.filesystem.allow_exec)?,
-            deny: normalize_patterns(&workspace_root, &policy.filesystem.deny_exec)?,
-            default_scope: default_exec,
-        };
+
         Ok(Self {
             workspace_root,
             read,
@@ -172,77 +182,145 @@ impl AccessPolicy {
         })
     }
 
-    /// Check access against allow/deny rules.
     fn check(&self, path: &Path, mode: AccessMode) -> AccessDecision {
-        let path = if path.is_absolute() {
-            normalize_path(path)
-        } else {
-            normalize_path(&self.workspace_root.join(path))
+        let working_dir = self.workspace_root.as_path();
+        let resolved = match resolve_user_path(path, working_dir, &self.workspace_root) {
+            Ok(path) => path,
+            Err(err) => return AccessDecision::Deny(err.to_string()),
         };
+
         let rules = match mode {
             AccessMode::Read => &self.read,
             AccessMode::Write => &self.write,
             AccessMode::Execute => &self.exec,
         };
-        if matches_any(&path, &rules.deny) {
-            return AccessDecision::Deny(format!(
-                "access denied by sandbox policy: {}",
-                path.display()
-            ));
-        }
-        if !rules.allow.is_empty() {
-            if matches_any(&path, &rules.allow) {
-                return AccessDecision::Allow;
-            }
-            return AccessDecision::Deny(format!(
-                "access not permitted by sandbox allowlist: {}",
-                path.display()
-            ));
-        }
-        match rules.default_scope {
-            DefaultScope::All => AccessDecision::Allow,
-            DefaultScope::WorkspaceOnly => {
-                if path.starts_with(&self.workspace_root) {
-                    AccessDecision::Allow
-                } else {
-                    AccessDecision::Deny(format!("path outside workspace root: {}", path.display()))
-                }
-            }
-            DefaultScope::None => AccessDecision::Deny(format!(
-                "sandbox mode blocks this access: {}",
-                path.display()
-            )),
+
+        if rules.allow_all || matches_any(&resolved, &rules.roots) {
+            AccessDecision::Allow
+        } else {
+            AccessDecision::Deny(format!(
+                "sandbox policy blocks {:?} access to {}",
+                mode,
+                resolved.display()
+            ))
         }
     }
 }
 
-/// Normalize path patterns into absolute paths.
-fn normalize_patterns(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>, SandboxError> {
+fn normalize_existing_roots(
+    root: &Path,
+    patterns: &[String],
+) -> Result<Vec<PathBuf>, SandboxError> {
     let mut resolved = Vec::new();
     for pattern in patterns {
-        if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-            return Err(SandboxError::InvalidConfig(format!(
-                "glob patterns are not supported in sandbox paths: {pattern}"
-            )));
-        }
+        reject_glob(pattern)?;
         let path = PathBuf::from(pattern);
         let joined = if path.is_absolute() {
             path
         } else {
             root.join(path)
         };
-        resolved.push(normalize_path(&joined));
+        resolved.push(canonicalize_existing_path(&joined)?);
     }
     Ok(resolved)
 }
 
-/// Check whether a path matches any prefix pattern.
+fn reject_glob(pattern: &str) -> Result<(), SandboxError> {
+    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        return Err(SandboxError::InvalidConfig(format!(
+            "glob patterns are not supported in sandbox paths: {pattern}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn canonicalize_existing_path(path: &Path) -> Result<PathBuf, SandboxError> {
+    path.canonicalize().map_err(|err| {
+        SandboxError::InvalidConfig(format!("failed to resolve {}: {err}", path.display()))
+    })
+}
+
+fn dedupe_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn matches_any(path: &Path, patterns: &[PathBuf]) -> bool {
     patterns.iter().any(|pattern| path.starts_with(pattern))
 }
 
-/// Normalize a path by resolving components.
-fn normalize_path(path: &Path) -> PathBuf {
+fn system_runtime_roots() -> Vec<PathBuf> {
+    ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/opt"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .filter_map(|path| canonicalize_existing_path(&path).ok())
+        .collect()
+}
+
+pub fn resolve_internal_landlock_helper_path() -> Result<PathBuf, SandboxError> {
+    if let Some(value) = std::env::var_os(LANDLOCK_HELPER_ENV) {
+        return canonicalize_existing_path(Path::new(&value));
+    }
+
+    if let Ok(path) = which::which(LANDLOCK_HELPER_NAME) {
+        return canonicalize_existing_path(&path);
+    }
+
+    let current_exe = std::env::current_exe().map_err(SandboxError::Io)?;
+    let mut search_roots = Vec::new();
+    if let Some(parent) = current_exe.parent() {
+        search_roots.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            search_roots.push(grandparent.to_path_buf());
+        }
+    }
+
+    for root in &search_roots {
+        let candidate = root.join(LANDLOCK_HELPER_NAME);
+        if candidate.exists() {
+            return canonicalize_existing_path(&candidate);
+        }
+    }
+
+    Err(SandboxError::DependencyMissing(format!(
+        "internal Landlock helper '{}' not found; set {} or place the binary on PATH",
+        LANDLOCK_HELPER_NAME, LANDLOCK_HELPER_ENV
+    )))
+}
+
+pub(crate) fn wrap_command_with_landlock(
+    command: PathBuf,
+    args: Vec<String>,
+    policy: Option<&CommandLandlockPolicy>,
+) -> Result<(PathBuf, Vec<String>), SandboxError> {
+    let Some(policy) = policy else {
+        return Ok((command, args));
+    };
+
+    let launcher = resolve_internal_landlock_helper_path()?;
+    let mut launcher_args = Vec::new();
+    for root in &policy.read_roots {
+        launcher_args.push("--read".to_string());
+        launcher_args.push(canonicalize_existing_path(root)?.display().to_string());
+    }
+    for root in &policy.write_roots {
+        launcher_args.push("--write".to_string());
+        launcher_args.push(canonicalize_existing_path(root)?.display().to_string());
+    }
+    for root in &policy.exec_roots {
+        launcher_args.push("--exec".to_string());
+        launcher_args.push(canonicalize_existing_path(root)?.display().to_string());
+    }
+    launcher_args.push("--".to_string());
+    launcher_args.push(command_display(&command));
+    launcher_args.extend(args);
+
+    Ok((launcher, launcher_args))
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -258,478 +336,196 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        AccessPolicy, bind_if_exists, build_env, build_mounts, build_prepared_sandbox,
-        command_display, matches_any, network_mode, normalize_path, normalize_patterns,
-        run_local_process,
-    };
-    use crate::{AccessDecision, AccessMode, CommandSpec, SandboxNetworkMode, SandboxPolicy};
-    use odyssey_rs_protocol::SandboxMode;
-    use pretty_assertions::assert_eq;
-    use std::path::{Path, PathBuf};
-    use tempfile::tempdir;
-
-    #[test]
-    fn read_only_mode_allows_read_but_denies_write_exec() {
-        let temp = tempdir().expect("tempdir");
-        let policy = SandboxPolicy::default();
-        let access =
-            AccessPolicy::new(SandboxMode::ReadOnly, &policy, temp.path()).expect("access policy");
-        let path = temp.path().join("file.txt");
-
-        assert_eq!(access.check(&path, AccessMode::Read), AccessDecision::Allow);
-        assert!(matches!(
-            access.check(&path, AccessMode::Write),
-            AccessDecision::Deny(_)
-        ));
-        assert!(matches!(
-            access.check(&path, AccessMode::Execute),
-            AccessDecision::Deny(_)
-        ));
-    }
-
-    #[test]
-    fn workspace_write_allows_within_workspace() {
-        let temp = tempdir().expect("tempdir");
-        let policy = SandboxPolicy::default();
-        let access = AccessPolicy::new(SandboxMode::WorkspaceWrite, &policy, temp.path())
-            .expect("access policy");
-        let path = temp.path().join("bin");
-
-        assert_eq!(access.check(&path, AccessMode::Read), AccessDecision::Allow);
-        assert_eq!(
-            access.check(&path, AccessMode::Write),
-            AccessDecision::Allow
-        );
-        assert_eq!(
-            access.check(&path, AccessMode::Execute),
-            AccessDecision::Allow
-        );
-    }
-
-    #[test]
-    fn deny_rules_override_allow_rules() {
-        let temp = tempdir().expect("tempdir");
-        let mut policy = SandboxPolicy::default();
-        let denied = temp.path().join("blocked");
-        policy
-            .filesystem
-            .allow_read
-            .push(denied.to_string_lossy().to_string());
-        policy
-            .filesystem
-            .deny_read
-            .push(denied.to_string_lossy().to_string());
-
-        let access = AccessPolicy::new(SandboxMode::WorkspaceWrite, &policy, temp.path())
-            .expect("access policy");
-        assert!(matches!(
-            access.check(&denied, AccessMode::Read),
-            AccessDecision::Deny(_)
-        ));
-    }
-
-    #[test]
-    fn normalize_patterns_rejects_globs() {
-        let temp = tempdir().expect("tempdir");
-        let err = normalize_patterns(temp.path(), &["/tmp/*.txt".to_string()])
-            .expect_err("glob rejected");
-        match err {
-            crate::SandboxError::InvalidConfig(message) => {
-                assert!(message.contains("glob patterns"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn normalize_path_resolves_components() {
-        let path = Path::new("/tmp/dir/../file.txt");
-        let normalized = normalize_path(path);
-        assert_eq!(normalized, PathBuf::from("/tmp/file.txt"));
-    }
-
-    #[test]
-    fn matches_any_checks_prefixes() {
-        let path = PathBuf::from("/tmp/data/file.txt");
-        let patterns = vec![PathBuf::from("/tmp/data")];
-        assert_eq!(matches_any(&path, &patterns), true);
-    }
-
-    #[test]
-    fn command_display_resolves_relative_paths() {
-        let display = command_display(Path::new("bin/run"), Path::new("/tmp")).expect("display");
-        assert_eq!(display, "/tmp/bin/run".to_string());
-    }
-
-    #[test]
-    fn bind_if_exists_adds_flag_when_present() {
-        let temp = tempdir().expect("tempdir");
-        let mut args = Vec::new();
-        bind_if_exists(&mut args, "--ro-bind", temp.path(), temp.path());
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[0], "--ro-bind");
-    }
-
-    #[test]
-    fn build_env_includes_set_values() {
-        let mut policy = SandboxPolicy::default();
-        policy
-            .env
-            .set
-            .insert("ODYSSEY_TEST".to_string(), "1".to_string());
-        let env = build_env(&policy);
-        assert_eq!(env.get("ODYSSEY_TEST"), Some(&"1".to_string()));
-    }
-
-    #[test]
-    fn network_mode_defaults_to_allow() {
-        let policy = SandboxPolicy::default();
-        assert_eq!(network_mode(&policy), SandboxNetworkMode::Allow);
-    }
-
-    #[test]
-    fn network_mode_denies_when_deny_listed() {
-        let mut policy = SandboxPolicy::default();
-        policy.network.deny_domains.push("example.com".to_string());
-        assert_eq!(network_mode(&policy), SandboxNetworkMode::Deny);
-    }
-
-    #[test]
-    fn build_mounts_includes_external_overrides() {
-        let workspace = tempdir().expect("workspace");
-        let external_read = tempdir().expect("external_read");
-        let external_write = tempdir().expect("external_write");
-
-        let mut policy = SandboxPolicy::default();
-        policy
-            .filesystem
-            .allow_read
-            .push(external_read.path().to_string_lossy().to_string());
-        policy
-            .filesystem
-            .allow_write
-            .push(external_write.path().to_string_lossy().to_string());
-
-        let mounts =
-            build_mounts(SandboxMode::WorkspaceWrite, &policy, workspace.path()).expect("mounts");
-        assert_eq!(mounts.len(), 3);
-
-        let read_mount = mounts
-            .iter()
-            .find(|mount| mount.source == normalize_path(external_read.path()))
-            .expect("read mount");
-        assert_eq!(read_mount.writable, false);
-
-        let write_mount = mounts
-            .iter()
-            .find(|mount| mount.source == normalize_path(external_write.path()))
-            .expect("write mount");
-        assert_eq!(write_mount.writable, true);
-    }
-
-    #[test]
-    fn build_mounts_rejects_missing_paths() {
-        let workspace = tempdir().expect("workspace");
-        let external = tempdir().expect("external");
-        let missing = external.path().join("missing");
-
-        let mut policy = SandboxPolicy::default();
-        policy
-            .filesystem
-            .allow_read
-            .push(missing.to_string_lossy().to_string());
-
-        let err = build_mounts(SandboxMode::WorkspaceWrite, &policy, workspace.path())
-            .expect_err("missing path");
-        match err {
-            crate::SandboxError::InvalidConfig(message) => {
-                assert_eq!(message.contains("does not exist"), true);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_prepared_sandbox_uses_network_and_env() {
-        let workspace = tempdir().expect("workspace");
-        let mut policy = SandboxPolicy::default();
-        policy
-            .env
-            .set
-            .insert("ODYSSEY_ENV".to_string(), "yes".to_string());
-        policy.network.deny_domains.push("example.com".to_string());
-
-        let ctx = crate::SandboxContext {
-            workspace_root: workspace.path().to_path_buf(),
-            mode: SandboxMode::WorkspaceWrite,
-            policy,
-        };
-        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
-        assert_eq!(prepared.network, SandboxNetworkMode::Deny);
-        assert_eq!(prepared.env.get("ODYSSEY_ENV"), Some(&"yes".to_string()));
-        assert_eq!(prepared.working_dir, normalize_path(workspace.path()));
-        assert_eq!(prepared.mounts.is_empty(), false);
-    }
-
-    #[tokio::test]
-    async fn run_local_process_captures_output() {
-        let workspace = tempdir().expect("workspace");
-        let ctx = crate::SandboxContext {
-            workspace_root: workspace.path().to_path_buf(),
-            mode: SandboxMode::WorkspaceWrite,
-            policy: SandboxPolicy::default(),
-        };
-        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
-
-        let mut spec = CommandSpec::new("sh");
-        spec.args.extend([
-            "-c".to_string(),
-            "printf 'out'; printf 'err' 1>&2".to_string(),
-        ]);
-
-        #[derive(Default)]
-        struct RecordingSink {
-            stdout: String,
-            stderr: String,
-        }
-
-        impl super::CommandOutputSink for RecordingSink {
-            fn stdout(&mut self, chunk: &str) {
-                self.stdout.push_str(chunk);
-            }
-
-            fn stderr(&mut self, chunk: &str) {
-                self.stderr.push_str(chunk);
-            }
-        }
-
-        let mut sink = RecordingSink::default();
-        let result = run_local_process(spec, &prepared, &mut sink)
-            .await
-            .expect("run");
-        assert_eq!(result.stdout, "out");
-        assert_eq!(result.stderr, "err");
-        assert_eq!(sink.stdout, "out");
-        assert_eq!(sink.stderr, "err");
-        assert_eq!(result.status_code, Some(0));
-    }
-}
-
-/// Build environment variables for sandboxed commands.
-fn build_env(policy: &SandboxPolicy) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    if policy.env.allow.is_empty() {
-        for (key, value) in std::env::vars() {
-            if policy
-                .env
-                .deny
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(&key))
-            {
-                continue;
-            }
-            env.insert(key, value);
-        }
-    } else {
-        for key in &policy.env.allow {
-            if policy
-                .env
-                .deny
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(key))
-            {
-                continue;
-            }
-            if let Ok(value) = std::env::var(key) {
-                env.insert(key.clone(), value);
-            }
-        }
-    }
-    for (key, value) in &policy.env.set {
-        env.insert(key.clone(), value.clone());
-    }
-    env
-}
-
-/// Determine network mode based on policy.
-fn network_mode(policy: &SandboxPolicy) -> SandboxNetworkMode {
-    let allow_configured = !policy.network.allow_domains.is_empty();
-    let deny_configured = !policy.network.deny_domains.is_empty();
-    if !allow_configured && !deny_configured {
-        return SandboxNetworkMode::Allow;
-    }
-    if allow_configured && !deny_configured {
-        warn!(
-            "sandbox allow_domains configured but domain filtering is not enforced; allowing network"
-        );
-        return SandboxNetworkMode::Allow;
-    }
-    warn!("sandbox deny_domains configured; network access disabled");
-    SandboxNetworkMode::Deny
-}
-
-/// Build mount list for sandbox execution.
-pub fn build_mounts(
-    mode: SandboxMode,
-    policy: &SandboxPolicy,
+fn resolve_user_path(
+    user_path: &Path,
+    working_dir: &Path,
     workspace_root: &Path,
-) -> Result<Vec<Mount>, SandboxError> {
-    let workspace_root = normalize_path(workspace_root);
-    let workspace_writable = matches!(
-        mode,
-        SandboxMode::WorkspaceWrite | SandboxMode::DangerFullAccess
-    );
-    let mut mounts = Vec::new();
-    mounts.push(Mount {
-        source: workspace_root.clone(),
-        target: workspace_root.clone(),
-        writable: workspace_writable,
-    });
-
-    let mut overrides: BTreeMap<PathBuf, bool> = BTreeMap::new();
-    for path in normalize_patterns(&workspace_root, &policy.filesystem.allow_read)? {
-        if path.starts_with(&workspace_root) {
-            continue;
-        }
-        overrides.entry(path).or_insert(false);
+) -> Result<PathBuf, SandboxError> {
+    if user_path.as_os_str().is_empty() {
+        return Err(SandboxError::AccessDenied(
+            "empty path is not allowed".to_string(),
+        ));
     }
-    for path in normalize_patterns(&workspace_root, &policy.filesystem.allow_exec)? {
-        if path.starts_with(&workspace_root) {
-            continue;
-        }
-        overrides.entry(path).or_insert(false);
-    }
-    for path in normalize_patterns(&workspace_root, &policy.filesystem.allow_write)? {
-        if path.starts_with(&workspace_root) {
-            continue;
-        }
-        overrides.insert(path, true);
-    }
-
-    for (path, writable) in overrides {
-        if !path.exists() {
-            return Err(SandboxError::InvalidConfig(format!(
-                "sandbox mount path does not exist: {}",
-                path.display()
+    for component in user_path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(SandboxError::AccessDenied(format!(
+                "path traversal is not allowed: {}",
+                user_path.display()
             )));
         }
-        mounts.push(Mount {
-            source: path.clone(),
-            target: path,
-            writable,
-        });
     }
 
-    debug!(
-        "sandbox mounts built (count={}, workspace_writable={})",
-        mounts.len(),
-        workspace_writable
-    );
-    Ok(mounts)
+    let candidate = if user_path.is_absolute() {
+        user_path.to_path_buf()
+    } else {
+        working_dir.join(user_path)
+    };
+    let candidate = normalize_lexical(&candidate);
+
+    let mut unresolved = Vec::<OsString>::new();
+    let mut cursor = candidate.as_path();
+    loop {
+        if cursor.exists() {
+            let mut resolved = cursor.canonicalize().map_err(SandboxError::Io)?;
+            for suffix in unresolved.iter().rev() {
+                resolved.push(suffix);
+            }
+            return Ok(normalize_lexical(&resolved));
+        }
+
+        if cursor == workspace_root.parent().unwrap_or_else(|| Path::new("/"))
+            && !workspace_root.exists()
+        {
+            return Err(SandboxError::AccessDenied(format!(
+                "workspace root does not exist: {}",
+                workspace_root.display()
+            )));
+        }
+
+        let Some(name) = cursor.file_name() else {
+            return Err(SandboxError::AccessDenied(format!(
+                "path cannot be resolved safely: {}",
+                user_path.display()
+            )));
+        };
+        unresolved.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return Err(SandboxError::AccessDenied(format!(
+                "path cannot be resolved safely: {}",
+                user_path.display()
+            )));
+        };
+        cursor = parent;
+    }
 }
 
-/// Build a prepared sandbox from context.
-pub fn build_prepared_sandbox(ctx: &SandboxContext) -> Result<PreparedSandbox, SandboxError> {
-    let access = AccessPolicy::new(ctx.mode, &ctx.policy, &ctx.workspace_root)?;
-    let env = build_env(&ctx.policy);
-    let network = network_mode(&ctx.policy);
-    let mounts = build_mounts(ctx.mode, &ctx.policy, &ctx.workspace_root)?;
-    info!(
-        "prepared sandbox (mode={:?}, mounts={}, env_keys={})",
-        ctx.mode,
-        mounts.len(),
-        env.len()
-    );
-    Ok(PreparedSandbox {
-        access,
-        env,
-        limits: ctx.policy.limits.clone(),
-        network,
-        working_dir: normalize_path(&ctx.workspace_root),
-        mounts,
-    })
+fn effective_output_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_STDIO_BYTES)
 }
 
-/// Buffering sink that captures stdout/stderr for non-streaming runs.
+fn effective_wall_clock(limit: Option<u64>) -> Option<std::time::Duration> {
+    Some(std::time::Duration::from_secs(
+        limit.unwrap_or(DEFAULT_WALL_CLOCK_SECONDS),
+    ))
+}
+
 #[derive(Default)]
-struct BufferingSink {
-    stdout: String,
-    stderr: String,
+pub(crate) struct BufferingSink {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl CommandOutputSink for BufferingSink {
-    /// Append stdout chunk.
     fn stdout(&mut self, chunk: &str) {
         self.stdout.push_str(chunk);
     }
 
-    /// Append stderr chunk.
     fn stderr(&mut self, chunk: &str) {
         self.stderr.push_str(chunk);
     }
 }
 
-/// Run a command locally with the prepared sandbox configuration.
-async fn run_local_process(
-    spec: CommandSpec,
-    prepared: &PreparedSandbox,
-    sink: &mut dyn CommandOutputSink,
-) -> Result<CommandResult, SandboxError> {
-    debug!(
-        "running local process (args_len={}, has_cwd={})",
-        spec.args.len(),
-        spec.cwd.is_some()
-    );
-    let mut command = Command::new(&spec.command);
-    command.args(&spec.args);
-    command.env_clear();
-    for (key, value) in &prepared.env {
-        command.env(key, value);
-    }
-    for (key, value) in &spec.env {
-        command.env(key, value);
-    }
-    if let Some(cwd) = &spec.cwd {
-        command.current_dir(cwd);
+fn build_env(
+    policy: &SandboxPolicy,
+    workspace_root: &Path,
+) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let inherit_keys = if policy.env.inherit.is_empty() {
+        SAFE_ENV_VARS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
     } else {
-        command.current_dir(&prepared.working_dir);
-    }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+        policy.env.inherit.clone()
+    };
 
-    #[cfg(target_os = "linux")]
-    {
-        let limits = prepared.limits.clone();
-        unsafe {
-            command.pre_exec(move || crate::provider::linux::apply_rlimits(&limits));
+    let mut env = BTreeMap::new();
+    let mut allowed = BTreeSet::new();
+
+    for key in inherit_keys {
+        if let Ok(value) = std::env::var(&key) {
+            allowed.insert(key.clone());
+            env.insert(key, value);
         }
     }
 
-    let mut child = command.spawn().map_err(SandboxError::Io)?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (stdout_buf, stderr_buf) = stream_child_output(stdout, stderr, sink).await?;
+    let tmp_dir = workspace_root.join(".tmp");
+    allowed.insert("HOME".to_string());
+    env.insert("HOME".to_string(), workspace_root.display().to_string());
+    allowed.insert("TMPDIR".to_string());
+    env.insert("TMPDIR".to_string(), tmp_dir.display().to_string());
+    allowed.insert("ODYSSEY_SANDBOX".to_string());
+    env.insert("ODYSSEY_SANDBOX".to_string(), "1".to_string());
 
-    let status = child.wait().await.map_err(SandboxError::Io)?;
+    if !env.contains_key("PATH") {
+        allowed.insert("PATH".to_string());
+        env.insert("PATH".to_string(), DEFAULT_PATH.to_string());
+    }
 
-    Ok(CommandResult {
-        status_code: status.code(),
-        stdout: stdout_buf,
-        stderr: stderr_buf,
-    })
+    for (key, value) in &policy.env.set {
+        allowed.insert(key.clone());
+        env.insert(key.clone(), value.clone());
+    }
+
+    (env, allowed)
 }
 
-/// Stream child stdout/stderr while capturing full buffers.
-pub async fn stream_child_output(
+pub(crate) fn merge_command_env(
+    prepared: &PreparedSandbox,
+    overrides: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, SandboxError> {
+    let mut env = prepared.env.clone();
+    for (key, value) in overrides {
+        if !prepared.allowed_env_keys.contains(key) {
+            return Err(SandboxError::AccessDenied(format!(
+                "environment variable is not allowed by sandbox policy: {key}"
+            )));
+        }
+        env.insert(key.clone(), value.clone());
+    }
+    Ok(env)
+}
+
+fn append_with_limit(
+    raw: &[u8],
+    buffer: &mut String,
+    limit: usize,
+    truncated: &mut bool,
+) -> Option<String> {
+    if *truncated {
+        return None;
+    }
+
+    let current = buffer.len();
+    if current >= limit {
+        *truncated = true;
+        return None;
+    }
+
+    let remaining = limit.saturating_sub(current);
+    if raw.len() <= remaining {
+        let chunk = String::from_utf8_lossy(raw).to_string();
+        buffer.push_str(&chunk);
+        return Some(chunk);
+    }
+
+    let chunk = String::from_utf8_lossy(&raw[..remaining]).to_string();
+    buffer.push_str(&chunk);
+    *truncated = true;
+    Some(chunk)
+}
+
+async fn stream_child_output(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     sink: &mut dyn CommandOutputSink,
-) -> Result<(String, String), SandboxError> {
-    let mut stdout_buf = String::new();
-    let mut stderr_buf = String::new();
+    limits: &SandboxLimits,
+) -> Result<(String, String, bool, bool), SandboxError> {
+    let mut stdout_buf = String::default();
+    let mut stderr_buf = String::default();
+    let stdout_limit = effective_output_limit(limits.stdout_bytes);
+    let stderr_limit = effective_output_limit(limits.stderr_bytes);
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
 
     let mut stdout_reader = stdout.map(tokio::io::BufReader::new);
     let mut stderr_reader = stderr.map(tokio::io::BufReader::new);
@@ -752,9 +548,12 @@ pub async fn stream_child_output(
                 let read = read.map_err(SandboxError::Io)?;
                 if read == 0 {
                     stdout_done = true;
-                } else {
-                    let chunk = String::from_utf8_lossy(&stdout_chunk[..read]);
-                    stdout_buf.push_str(&chunk);
+                } else if let Some(chunk) = append_with_limit(
+                    &stdout_chunk[..read],
+                    &mut stdout_buf,
+                    stdout_limit,
+                    &mut stdout_truncated,
+                ) {
                     sink.stdout(&chunk);
                 }
             }
@@ -768,35 +567,640 @@ pub async fn stream_child_output(
                 let read = read.map_err(SandboxError::Io)?;
                 if read == 0 {
                     stderr_done = true;
-                } else {
-                    let chunk = String::from_utf8_lossy(&stderr_chunk[..read]);
-                    stderr_buf.push_str(&chunk);
+                } else if let Some(chunk) = append_with_limit(
+                    &stderr_chunk[..read],
+                    &mut stderr_buf,
+                    stderr_limit,
+                    &mut stderr_truncated,
+                ) {
                     sink.stderr(&chunk);
                 }
             }
         }
     }
 
-    Ok((stdout_buf, stderr_buf))
+    if stdout_truncated {
+        let note = "\n...[stdout truncated by sandbox]";
+        stdout_buf.push_str(note);
+        sink.stdout(note);
+    }
+    if stderr_truncated {
+        let note = "\n...[stderr truncated by sandbox]";
+        stderr_buf.push_str(note);
+        sink.stderr(note);
+    }
+
+    Ok((stdout_buf, stderr_buf, stdout_truncated, stderr_truncated))
 }
 
-/// Build a displayable command string relative to working directory.
-pub fn command_display(command: &Path, working_dir: &Path) -> Result<String, SandboxError> {
-    if command.is_absolute() {
-        return Ok(command.display().to_string());
+#[cfg(unix)]
+pub(crate) unsafe fn configure_child_unix(command: &mut Command, limits: &SandboxLimits) {
+    let limits = limits.clone();
+    unsafe {
+        command.pre_exec(move || {
+            let setpgid_result = libc::setpgid(0, 0);
+            if setpgid_result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            crate::provider::linux::apply_rlimits(&limits)?;
+            Ok(())
+        });
     }
-    if command.components().count() > 1 {
-        let absolute = normalize_path(&working_dir.join(command));
-        return Ok(absolute.display().to_string());
-    }
-    Ok(command.display().to_string())
 }
 
-/// Add bind mount args if the source exists.
+#[cfg(unix)]
+async fn kill_process_tree(pid: u32) -> Result<(), SandboxError> {
+    let pgid = -(pid as i32);
+    let term_result = unsafe { libc::kill(pgid, libc::SIGTERM) };
+    if term_result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(SandboxError::Io(err));
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let kill_result = unsafe { libc::kill(pgid, libc::SIGKILL) };
+    if kill_result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(SandboxError::Io(err));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn kill_process_tree(_pid: u32) -> Result<(), SandboxError> {
+    Ok(())
+}
+
+pub(crate) async fn collect_child_result(
+    child: &mut tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    sink: &mut dyn CommandOutputSink,
+    limits: &SandboxLimits,
+) -> Result<CommandResult, SandboxError> {
+    let execution = async {
+        let (stdout, stderr, stdout_truncated, stderr_truncated) =
+            stream_child_output(stdout, stderr, sink, limits).await?;
+        let status = child.wait().await.map_err(SandboxError::Io)?;
+
+        Ok(CommandResult {
+            status_code: status.code(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
+    };
+
+    if let Some(timeout) = effective_wall_clock(limits.wall_clock_seconds) {
+        match tokio::time::timeout(timeout, execution).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(pid) = child.id() {
+                    kill_process_tree(pid).await?;
+                }
+                let _ = child.wait().await;
+                Err(SandboxError::LimitExceeded(format!(
+                    "command exceeded wall clock limit of {} seconds",
+                    timeout.as_secs()
+                )))
+            }
+        }
+    } else {
+        execution.await
+    }
+}
+
+pub(crate) fn resolve_working_dir(
+    spec: &CommandSpec,
+    prepared: &PreparedSandbox,
+) -> Result<PathBuf, SandboxError> {
+    let cwd = spec.cwd.as_ref().unwrap_or(&prepared.working_dir);
+    let resolved = resolve_user_path(cwd, &prepared.working_dir, &prepared.access.workspace_root)?;
+    if !resolved.is_dir() {
+        return Err(SandboxError::AccessDenied(format!(
+            "working directory is not a directory: {}",
+            resolved.display()
+        )));
+    }
+    match prepared.access.check(&resolved, AccessMode::Read) {
+        AccessDecision::Allow => Ok(resolved),
+        AccessDecision::Deny(reason) => Err(SandboxError::AccessDenied(reason)),
+    }
+}
+
+pub(crate) fn resolve_command_path(
+    command: &Path,
+    working_dir: &Path,
+    prepared: &PreparedSandbox,
+) -> Result<PathBuf, SandboxError> {
+    if command.is_absolute() || command.components().count() > 1 {
+        let resolved = resolve_user_path(command, working_dir, &prepared.access.workspace_root)?;
+        return match prepared.access.check(&resolved, AccessMode::Execute) {
+            AccessDecision::Allow => Ok(resolved),
+            AccessDecision::Deny(reason) => Err(SandboxError::AccessDenied(reason)),
+        };
+    }
+
+    let path_value = prepared
+        .env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_PATH.to_string());
+    for root in std::env::split_paths(&path_value) {
+        let candidate = root.join(command);
+        if !candidate.exists() {
+            continue;
+        }
+        let resolved = candidate.canonicalize().map_err(SandboxError::Io)?;
+        if matches!(
+            prepared.access.check(&resolved, AccessMode::Execute),
+            AccessDecision::Allow
+        ) {
+            return Ok(resolved);
+        }
+    }
+
+    Err(SandboxError::AccessDenied(format!(
+        "executable is not permitted by sandbox policy: {}",
+        command.display()
+    )))
+}
+
+fn build_mounts_from_access(access: &AccessPolicy, mode: SandboxMode) -> Vec<Mount> {
+    if matches!(mode, SandboxMode::DangerFullAccess) {
+        return Vec::new();
+    }
+
+    let workspace_writable = matches!(mode, SandboxMode::WorkspaceWrite);
+    let mut mount_modes: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    mount_modes.insert(access.workspace_root.clone(), workspace_writable);
+
+    for path in access.read.roots.iter().chain(access.exec.roots.iter()) {
+        mount_modes.entry(path.clone()).or_insert(false);
+    }
+    for path in &access.write.roots {
+        mount_modes.insert(path.clone(), true);
+    }
+
+    mount_modes
+        .into_iter()
+        .map(|(path, writable)| Mount {
+            source: path.clone(),
+            target: path,
+            writable,
+        })
+        .collect()
+}
+
+pub fn build_prepared_sandbox(ctx: &SandboxContext) -> Result<PreparedSandbox, SandboxError> {
+    let workspace_root = canonicalize_existing_path(&ctx.workspace_root)?;
+    std::fs::create_dir_all(workspace_root.join(".tmp")).map_err(SandboxError::Io)?;
+    let access = AccessPolicy::new(ctx.mode, &ctx.policy, &workspace_root)?;
+    let (env, allowed_env_keys) = build_env(&ctx.policy, &workspace_root);
+    let mounts = build_mounts_from_access(&access, ctx.mode);
+    info!(
+        "prepared sandbox (mode={:?}, mounts={}, env_keys={})",
+        ctx.mode,
+        mounts.len(),
+        env.len()
+    );
+    Ok(PreparedSandbox {
+        access,
+        env,
+        allowed_env_keys,
+        limits: ctx.policy.limits.clone(),
+        network: ctx.policy.network.mode,
+        working_dir: workspace_root,
+        mounts,
+    })
+}
+
+pub(crate) fn build_host_child_command(
+    spec: CommandSpec,
+    prepared: &PreparedSandbox,
+) -> Result<Command, SandboxError> {
+    let cwd = resolve_working_dir(&spec, prepared)?;
+    let command = resolve_command_path(&spec.command, &cwd, prepared)?;
+    let env = merge_command_env(prepared, &spec.env)?;
+    let (command, args) = wrap_command_with_landlock(command, spec.args, spec.landlock.as_ref())?;
+
+    let mut child_command = Command::new(&command);
+    child_command.args(&args);
+    child_command.current_dir(&cwd);
+    child_command.env_clear();
+    child_command.envs(&env);
+
+    #[cfg(unix)]
+    unsafe {
+        configure_child_unix(&mut child_command, &prepared.limits);
+    }
+
+    Ok(child_command)
+}
+
+pub(crate) async fn run_host_process(
+    spec: CommandSpec,
+    prepared: &PreparedSandbox,
+    sink: &mut dyn CommandOutputSink,
+) -> Result<CommandResult, SandboxError> {
+    let mut child_command = build_host_child_command(spec, prepared)?;
+    child_command.stdout(std::process::Stdio::piped());
+    child_command.stderr(std::process::Stdio::piped());
+
+    let mut child = child_command.spawn().map_err(SandboxError::Io)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    collect_child_result(&mut child, stdout, stderr, sink, &prepared.limits).await
+}
+
+pub fn command_display(command: &Path) -> String {
+    command.display().to_string()
+}
+
 pub fn bind_if_exists(args: &mut Vec<String>, flag: &str, source: &Path, target: &Path) {
     if source.exists() {
         args.push(flag.to_string());
         args.push(source.display().to_string());
         args.push(target.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AccessPolicy, bind_if_exists, build_mounts_from_access, build_prepared_sandbox,
+        command_display, effective_output_limit, effective_wall_clock, merge_command_env,
+        normalize_existing_roots, normalize_lexical, reject_glob, resolve_command_path,
+        resolve_user_path, resolve_working_dir, run_host_process,
+    };
+    use crate::{
+        AccessDecision, AccessMode, CommandSpec, SandboxContext, SandboxFilesystemPolicy,
+        SandboxLimits, SandboxNetworkMode, SandboxPolicy,
+    };
+    use odyssey_rs_protocol::SandboxMode;
+    use pretty_assertions::assert_eq;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    #[test]
+    fn read_only_mode_allows_system_exec_but_denies_workspace_write() {
+        let temp = tempdir().expect("tempdir");
+        let policy = SandboxPolicy::default();
+        let access =
+            AccessPolicy::new(SandboxMode::ReadOnly, &policy, temp.path()).expect("access");
+        let inside = temp.path().join("file.txt");
+        assert_eq!(
+            access.check(&inside, AccessMode::Read),
+            AccessDecision::Allow
+        );
+        assert!(matches!(
+            access.check(&inside, AccessMode::Write),
+            AccessDecision::Deny(_)
+        ));
+        assert_eq!(
+            matches!(
+                access.check(Path::new("/bin/sh"), AccessMode::Execute),
+                AccessDecision::Allow
+            ),
+            Path::new("/bin/sh").exists()
+        );
+    }
+
+    #[test]
+    fn workspace_write_allows_within_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let policy = SandboxPolicy::default();
+        let access =
+            AccessPolicy::new(SandboxMode::WorkspaceWrite, &policy, temp.path()).expect("access");
+        let path = temp.path().join("bin");
+        assert_eq!(access.check(&path, AccessMode::Read), AccessDecision::Allow);
+        assert_eq!(
+            access.check(&path, AccessMode::Write),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn reject_glob_blocks_patterns() {
+        let err = reject_glob("/sandbox-root/*.txt").expect_err("glob rejected");
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration: glob patterns are not supported in sandbox paths: /sandbox-root/*.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_existing_roots_requires_existing_paths() {
+        let temp = tempdir().expect("tempdir");
+        let err = normalize_existing_roots(temp.path(), &["missing".to_string()])
+            .expect_err("missing path");
+        assert!(err.to_string().contains("failed to resolve"));
+    }
+
+    #[test]
+    fn normalize_lexical_resolves_components() {
+        let path = Path::new("/sandbox-root/dir/../file.txt");
+        assert_eq!(
+            normalize_lexical(path),
+            PathBuf::from("/sandbox-root/file.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_user_path_rejects_parent_dir() {
+        let temp = tempdir().expect("tempdir");
+        let err = resolve_user_path(Path::new("../oops"), temp.path(), temp.path())
+            .expect_err("parent dir rejected");
+        assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn resolve_user_path_rejects_empty_path() {
+        let temp = tempdir().expect("tempdir");
+        let err = resolve_user_path(Path::new(""), temp.path(), temp.path())
+            .expect_err("empty path rejected");
+        assert_eq!(err.to_string(), "access denied: empty path is not allowed");
+    }
+
+    #[test]
+    fn resolve_user_path_preserves_unresolved_suffix_inside_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let existing = temp.path().join("existing");
+        std::fs::create_dir_all(&existing).expect("create existing");
+
+        let resolved =
+            resolve_user_path(Path::new("existing/new-file.txt"), temp.path(), temp.path())
+                .expect("resolve path");
+
+        assert_eq!(resolved, existing.join("new-file.txt"));
+    }
+
+    #[test]
+    fn command_display_returns_absolute_path() {
+        assert_eq!(
+            command_display(Path::new("/sandbox-root/bin/run")),
+            "/sandbox-root/bin/run".to_string()
+        );
+    }
+
+    #[test]
+    fn bind_if_exists_adds_flag_when_present() {
+        let temp = tempdir().expect("tempdir");
+        let mut args = Vec::new();
+        bind_if_exists(&mut args, "--ro-bind", temp.path(), temp.path());
+        assert_eq!(args[0], "--ro-bind");
+    }
+
+    #[test]
+    fn build_prepared_sandbox_uses_network_and_env_defaults() {
+        let temp = tempdir().expect("tempdir");
+        let mut policy = SandboxPolicy::default();
+        policy.network.mode = SandboxNetworkMode::Disabled;
+        policy.env.set.insert("FOO".to_string(), "BAR".to_string());
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy,
+        };
+
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        assert_eq!(prepared.network, SandboxNetworkMode::Disabled);
+        assert_eq!(prepared.env.get("FOO"), Some(&"BAR".to_string()));
+        assert!(prepared.env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn merge_command_env_rejects_unapproved_overrides() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let overrides = std::iter::once(("UNSAFE".to_string(), "1".to_string())).collect();
+
+        let error = merge_command_env(&prepared, &overrides).expect_err("override rejected");
+        assert_eq!(
+            error.to_string(),
+            "access denied: environment variable is not allowed by sandbox policy: UNSAFE"
+        );
+    }
+
+    #[test]
+    fn effective_limits_use_defaults() {
+        assert_eq!(effective_output_limit(None), 64 * 1024);
+        assert_eq!(effective_output_limit(Some(17)), 17);
+        assert_eq!(
+            effective_wall_clock(None),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            effective_wall_clock(Some(7)),
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn build_mounts_from_access_tracks_writable_roots_by_mode() {
+        let temp = tempdir().expect("tempdir");
+        let extra_read = temp.path().join("read");
+        let extra_write = temp.path().join("write");
+        std::fs::create_dir_all(&extra_read).expect("create read");
+        std::fs::create_dir_all(&extra_write).expect("create write");
+        let policy = SandboxPolicy {
+            filesystem: SandboxFilesystemPolicy {
+                read_roots: vec![extra_read.display().to_string()],
+                write_roots: vec![extra_write.display().to_string()],
+                exec_roots: Vec::new(),
+            },
+            ..SandboxPolicy::default()
+        };
+        let access =
+            AccessPolicy::new(SandboxMode::WorkspaceWrite, &policy, temp.path()).expect("access");
+
+        let mounts = build_mounts_from_access(&access, SandboxMode::WorkspaceWrite);
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == temp.path() && mount.writable)
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == extra_read && !mount.writable)
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == extra_write && mount.writable)
+        );
+
+        let no_mounts = build_mounts_from_access(&access, SandboxMode::DangerFullAccess);
+        assert!(no_mounts.is_empty());
+    }
+
+    #[test]
+    fn resolve_working_dir_rejects_file_paths() {
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("file.txt");
+        std::fs::write(&file, "data").expect("write file");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let mut spec = CommandSpec::new("sh");
+        spec.cwd = Some(file);
+
+        let error = resolve_working_dir(&spec, &prepared).expect_err("file cwd rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("working directory is not a directory")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_host_process_captures_output_and_truncates() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy {
+                limits: SandboxLimits {
+                    stdout_bytes: Some(4),
+                    stderr_bytes: Some(4),
+                    ..SandboxLimits::default()
+                },
+                ..SandboxPolicy::default()
+            },
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let mut spec = CommandSpec::new("sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "printf out123; printf err123 1>&2".to_string(),
+        ];
+
+        struct RecordingSink {
+            stdout: String,
+            stderr: String,
+        }
+
+        impl crate::provider::CommandOutputSink for RecordingSink {
+            fn stdout(&mut self, chunk: &str) {
+                self.stdout.push_str(chunk);
+            }
+            fn stderr(&mut self, chunk: &str) {
+                self.stderr.push_str(chunk);
+            }
+        }
+
+        let mut sink = RecordingSink {
+            stdout: String::default(),
+            stderr: String::default(),
+        };
+        let result = run_host_process(spec, &prepared, &mut sink)
+            .await
+            .expect("run");
+        assert!(result.stdout_truncated);
+        assert!(result.stderr_truncated);
+        assert!(result.stdout.contains("truncated"));
+        assert!(result.stderr.contains("truncated"));
+        assert_eq!(result.status_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn run_host_process_enforces_wall_clock_limit() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy {
+                limits: SandboxLimits {
+                    wall_clock_seconds: Some(0),
+                    ..SandboxLimits::default()
+                },
+                ..SandboxPolicy::default()
+            },
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let mut spec = CommandSpec::new("sh");
+        spec.args = vec!["-c".to_string(), "sleep 1".to_string()];
+
+        let mut sink = crate::provider::BufferingSink::default();
+        let error = run_host_process(spec, &prepared, &mut sink)
+            .await
+            .expect_err("timeout expected");
+        assert!(
+            error
+                .to_string()
+                .contains("command exceeded wall clock limit of 0 seconds")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_host_process_enforces_wall_clock_limit_after_stdio_closes() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy {
+                limits: SandboxLimits {
+                    wall_clock_seconds: Some(1),
+                    ..SandboxLimits::default()
+                },
+                ..SandboxPolicy::default()
+            },
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let mut spec = CommandSpec::new("sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "exec >/dev/null 2>&1; sleep 2".to_string(),
+        ];
+
+        let mut sink = crate::provider::BufferingSink::default();
+        let error = run_host_process(spec, &prepared, &mut sink)
+            .await
+            .expect_err("timeout expected");
+        assert!(
+            error
+                .to_string()
+                .contains("command exceeded wall clock limit of 1 seconds")
+        );
+    }
+
+    #[test]
+    fn resolve_command_path_honors_exec_roots() {
+        let temp = tempdir().expect("tempdir");
+        let policy = SandboxPolicy {
+            filesystem: SandboxFilesystemPolicy {
+                exec_roots: vec!["/bin".to_string()],
+                ..SandboxFilesystemPolicy::default()
+            },
+            ..SandboxPolicy::default()
+        };
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::ReadOnly,
+            policy,
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let resolved =
+            resolve_command_path(Path::new("sh"), temp.path(), &prepared).expect("resolve");
+        assert!(resolved.exists());
+        assert!(resolved.file_name().is_some());
     }
 }
