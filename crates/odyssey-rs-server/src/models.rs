@@ -74,7 +74,7 @@ mod tests {
     fn request_models_deserialize_expected_payloads() {
         let task = Task::new("hello");
         let build: BuildRequest = serde_json::from_value(json!({
-            "project_path": "/tmp/project"
+            "project_path": "/workspace/project"
         }))
         .expect("build request");
         let create: CreateSessionRequest = serde_json::from_value(json!({
@@ -96,11 +96,11 @@ mod tests {
         .expect("publish request");
         let export: ExportRequest = serde_json::from_value(json!({
             "reference": "demo@0.1.0",
-            "output_path": "/tmp/out"
+            "output_path": "/workspace/out"
         }))
         .expect("export request");
         let import: ImportRequest = serde_json::from_value(json!({
-            "archive_path": "/tmp/demo.odyssey"
+            "archive_path": "/workspace/demo.odyssey"
         }))
         .expect("import request");
         let approval: ResolveApprovalRequest = serde_json::from_value(json!({
@@ -108,7 +108,7 @@ mod tests {
         }))
         .expect("approval request");
 
-        assert_eq!(build.project_path, "/tmp/project");
+        assert_eq!(build.project_path, "/workspace/project");
         assert_eq!(create.agent_ref, "demo@0.1.0");
         assert!(create.model.is_none());
         assert!(run.turn_context.is_none());
@@ -118,8 +118,8 @@ mod tests {
         assert_eq!(publish.source, "demo@0.1.0");
         assert_eq!(publish.target, "team/demo:0.1.0");
         assert_eq!(export.reference, "demo@0.1.0");
-        assert_eq!(export.output_path, "/tmp/out");
-        assert_eq!(import.archive_path, "/tmp/demo.odyssey");
+        assert_eq!(export.output_path, "/workspace/out");
+        assert_eq!(import.archive_path, "/workspace/demo.odyssey");
         assert_eq!(approval.decision, ApprovalDecision::Deny);
     }
 
