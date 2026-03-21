@@ -1,0 +1,160 @@
+---
+title: Bundle Format
+slug: /bundle-format
+description: Manifest and build layout reference for Odyssey bundles.
+---
+
+## Source Project Layout
+
+A bundle project is created by `odyssey-rs init <path>` and contains:
+
+```text
+<project>/
+  odyssey.bundle.json5   # Bundle manifest
+  agent.yaml             # Agent spec (path configurable via agent_spec)
+  README.md              # Bundle documentation
+  skills/                # Skill directories referenced by manifest
+  resources/             # Resource files referenced by manifest
+```
+
+`odyssey.bundle.json5` points to the agent spec file through `agent_spec`, so the YAML file does
+not have to be named `agent.yaml`, but the default templates use that name.
+
+## Manifest Schema
+
+The bundle manifest (`odyssey.bundle.json5`) deserializes into `BundleManifest`. Here is the full
+default template:
+
+```json5
+{
+  id: 'my-bundle',
+  version: '0.1.0',
+  agent_spec: 'agent.yaml',
+  executor: { type: 'prebuilt', id: 'react' },
+  memory: {
+    provider: { type: 'prebuilt', id: 'sliding_window' },
+    config: { max_window: 100 }
+  },
+  skills: [],
+  resources: [],
+  tools: [],
+  server: { enable_http: true },
+  sandbox: {
+    mode: 'workspace_write',
+    permissions: {
+      filesystem: {
+        exec: [],
+        mounts: { read: [], write: [] }
+      },
+      network: [],
+      tools: {
+        mode: 'default',
+        rules: []
+      }
+    },
+    system_tools: [],
+    resources: { cpu: 1, memory_mb: 512, gpu: 0 }
+  }
+}
+```
+
+### Top-level fields
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string | Unique bundle identifier (required) |
+| `version` | string | Semantic version (required) |
+| `agent_spec` | string | Relative path to the agent YAML file (required) |
+| `executor` | object | Executor configuration (required) |
+| `memory` | object | Memory provider configuration |
+| `skills` | array | Skill entries (`{ name, path }`) |
+| `resources` | array | Relative paths to resource files or directories |
+| `tools` | array | Tool entries (`{ name, source }`) |
+| `server` | object | Server configuration (`{ enable_http }`) |
+| `sandbox` | object | Sandbox execution policies |
+
+### Sandbox fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | string | `"workspace_write"` | Isolation mode: `read_only`, `workspace_write`, or `danger_full_access` |
+| `permissions.filesystem.exec` | string[] | `[]` | Executable paths |
+| `permissions.filesystem.mounts.read` | string[] | `[]` | Read-only host mount paths (must be absolute) |
+| `permissions.filesystem.mounts.write` | string[] | `[]` | Read-write host mount paths (must be absolute) |
+| `permissions.network` | string[] | `[]` | Network whitelist (empty = no network access) |
+| `permissions.tools.mode` | string | `"default"` | Tool permission mode |
+| `permissions.tools.rules` | array | `[]` | Per-tool rules (`{ action, tool }` where action is `allow`, `ask`, or `deny`) |
+| `system_tools` | string[] | `[]` | System tool identifiers |
+| `resources.cpu` | number | `1` | CPU limit |
+| `resources.memory_mb` | number | `512` | Memory limit in MB |
+| `resources.gpu` | number | `0` | GPU limit |
+
+### Validation rules
+
+- `executor.type` must be `prebuilt`
+- `memory.provider.type` must be `prebuilt`
+- `executor.id` and `memory.provider.id` must be non-empty
+- Each resource and skill path must exist inside the project
+- Host mount paths in `sandbox.permissions.filesystem.mounts.read` and `.write` must be absolute
+- Tool entries must use `source: "builtin"`
+
+### Current implementation limits
+
+- `executor.id = "react"` is the only executor implemented by the runtime
+- `memory.provider.id = "sliding_window"` is the only memory provider implemented
+- Only `source: "builtin"` tools are supported (no custom tools in v1)
+
+## Agent Spec
+
+The agent spec YAML (`agent.yaml`) maps to `AgentSpec`. Default template:
+
+```yaml
+id: my-bundle
+description: my-bundle agent using Odyssey runtime
+prompt: |
+  You are a helpful assistant Tess, Created by LiquidOS.
+model:
+  provider: openai
+  name: gpt-4.1-mini
+tools:
+  allow: []
+  deny: []
+```
+
+### Fields
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `id` | string | yes | Agent identifier |
+| `description` | string | no | Human-readable description |
+| `prompt` | string | yes | System prompt |
+| `model` | object | yes | LLM configuration |
+| `model.provider` | string | yes | Provider name (e.g. `openai`, `anthropic`) |
+| `model.name` | string | yes | Model name (e.g. `gpt-4.1-mini`) |
+| `model.config` | object | no | Provider-specific configuration |
+| `tools.allow` | string[] | no | Tool allowlist |
+| `tools.deny` | string[] | no | Tool denylist |
+
+`model` can be overridden at session creation and again per-turn through `TurnContextOverride.model`.
+
+## Build Output Layout
+
+`odyssey-rs-bundle` materializes an installable bundle layout (OCI-compliant):
+
+```text
+<install-root>/
+  agent.yaml
+  bundle.json
+  index.json
+  oci-layout
+  blobs/
+  resources/
+  skills/
+```
+
+Build behavior that matters when authoring bundles:
+
+- The agent spec file is copied into the built layout as `agent.yaml`
+- Each skill entry is copied into `skills/<skill.name>`
+- Each resource entry is copied into `resources/<basename>`
+- The manifest (`odyssey.bundle.json5`) is not included in the payload layer

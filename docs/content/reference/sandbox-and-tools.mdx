@@ -1,4 +1,8 @@
-# Sandbox And Tools
+---
+title: Sandbox And Tools
+slug: /sandbox-and-tools
+description: Builtin tools, sandbox modes, and approval behavior in Odyssey.
+---
 
 ## Builtin Tools
 
@@ -17,8 +21,8 @@ The builtin tool registry currently contains:
 Tool availability is the result of two filters:
 
 1. Bundle manifest filter:
-   if `manifest.tools` is empty, the runtime starts from the full builtin registry;
-   otherwise it starts from the named manifest tool list.
+   if `manifest.tools` is empty, the runtime starts from the full builtin registry; otherwise it
+   starts from the named manifest tool list.
 2. Agent spec filter:
    `tools.allow` narrows that list unless it contains `*`, and `tools.deny` removes entries.
 
@@ -46,7 +50,8 @@ The runtime builds sandbox filesystem policy from the manifest:
 - `mounts.write` becomes host write roots
 - `filesystem.exec` becomes executable paths under the staged bundle root
 
-The sandbox cell root itself is always added as a readable root. In `workspace_write` and `danger_full_access`, that cell root is also writable.
+The sandbox cell root itself is always added as a readable root. In `workspace_write` and
+`danger_full_access`, that cell root is also writable.
 
 ## Network Policy
 
@@ -55,9 +60,11 @@ The current network implementation is intentionally simple:
 - an empty `sandbox.permissions.network` list disables network access
 - a non-empty list enables outbound network access
 
-The individual strings in that list are not enforced as a hostname allowlist by the current sandbox bridge. At the moment the list acts like an on/off switch.
+The individual strings in that list are not enforced as a hostname allowlist by the current
+sandbox bridge. At the moment the list acts like an on/off switch.
 
-One practical consequence: when the runtime falls back to the host provider and the bundle disables network, execution is rejected because the host backend cannot safely emulate that restriction.
+One practical consequence: when the runtime falls back to the host provider and the bundle disables
+network, execution is rejected because the host backend cannot safely emulate that restriction.
 
 ## Tool Permission Rules
 
@@ -71,4 +78,5 @@ Important details from the current implementation:
 
 ## System Tools
 
-`sandbox.system_tools` is currently used as a preflight dependency check. Before execution starts, the runtime verifies that each named binary exists using   `which`.
+`sandbox.system_tools` is currently used as a preflight dependency check. Before execution starts,
+the runtime verifies that each named binary exists using `which`.

@@ -35,7 +35,7 @@ pub struct TuiRunConfig {
 
 pub const DEFAULT_BUNDLE_REF: &str = "odyssey@latest";
 
-/// Launch the Odyssey TUI against a pre-configured [`RuntimeEngine`].
+/// Launch the Odyssey TUI against a pre-configured [`OdysseyRuntime`].
 pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::Result<()> {
     let TuiRunConfig {
         bundle_ref,

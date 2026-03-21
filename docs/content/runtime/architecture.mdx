@@ -1,4 +1,8 @@
-# Runtime Architecture
+---
+title: Runtime Architecture
+slug: /architecture
+description: Architectural overview of scheduling, state, and transport surfaces in Odyssey.
+---
 
 ## Current Execution Stack
 
@@ -6,7 +10,8 @@
 2. A session is created or loaded from the session store.
 3. The scheduler enqueues the request and assigns it to a Tokio worker slot.
 4. The runtime stages the bundle into a sandbox cell and builds a `ToolContext`.
-5. The runtime selects builtin tools, loads bundle skills, resolves the model provider, and preloads memory from prior turns.
+5. The runtime selects builtin tools, loads bundle skills, resolves the model provider, and
+   preloads memory from prior turns.
 6. The `react` executor runs the turn and emits streamed events.
 7. The completed turn is normalized into session history and persisted to disk.
 
@@ -31,7 +36,8 @@ Each run then builds its own execution-local state:
 - the memory provider for that session's history
 - the turn context and event sender
 
-That split is what lets the runtime execute multiple turns concurrently without rebuilding global state each time.
+That split is what lets the runtime execute multiple turns concurrently without rebuilding global
+state each time.
 
 ## Scheduler
 
@@ -41,9 +47,11 @@ The scheduler is an in-process queue backed by:
 - a semaphore for concurrency control
 - an in-memory map of `turn_id -> ExecutionStatus`
 
-`submit` enqueues work and returns immediately. `run` submits the same work but also waits on a completion channel for the final `RunOutput`.
+`submit` enqueues work and returns immediately. `run` submits the same work but also waits on a
+completion channel for the final `RunOutput`.
 
-There is no distributed worker system in the current repository. Concurrency is local to one process.
+There is no distributed worker system in the current repository. Concurrency is local to one
+process.
 
 ## Session Persistence
 
@@ -64,4 +72,5 @@ Three entry points sit on top of the same runtime contract:
 - the HTTP server constructs `OdysseyRuntime` once and exposes bundle and session routes
 - the TUI constructs `OdysseyRuntime` directly and subscribes to its session event stream
 
-The server is not a separate execution engine. It is a thin network wrapper over the same runtime type.
+The server is not a separate execution engine. It is a thin network wrapper over the same runtime
+type.

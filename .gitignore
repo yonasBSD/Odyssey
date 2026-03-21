@@ -1,6 +1,9 @@
 /target
 /reference
 docs/book/
+docs/build/
+docs/.docusaurus/
+docs/node_modules/
 
 .odyssey
 

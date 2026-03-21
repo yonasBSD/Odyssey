@@ -1,9 +1,13 @@
-# Getting Started
+---
+title: Getting Started
+slug: /getting-started
+description: Build, install, and run your first Odyssey bundle locally.
+---
 
 ## Prerequisites
 
 - A Rust toolchain
-- An API key for whichever cloud model provider your bundle uses
+- An API key for the cloud model provider your bundle uses
 
 ## Initialize A Bundle
 
@@ -21,7 +25,8 @@ The template creates:
 - `skills/`
 - `resources/`
 
-The default template uses the `react` executor, the `sliding_window` memory provider, and an OpenAI model entry in `agent.yaml`.
+The default template uses the `react` executor, the `sliding_window` memory provider, and an
+OpenAI model entry in `agent.yaml`.
 
 ## Build And Install
 
@@ -45,14 +50,15 @@ cargo run -p odyssey-rs -- build ./hello-world --output ./dist
 
 ## Run A Prompt
 
-`run` is a one-shot command. It creates a fresh session, sends one prompt, prints the final assistant response, and exits.
+`run` is a one-shot command. It creates a fresh session, sends one prompt, prints the final
+assistant response, and exits.
 
 ```bash
 export OPENAI_API_KEY="your-key"
 cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?"
 ```
 
-When you want to bypass sandbox restrictions locally:
+When you need to bypass sandbox restrictions locally:
 
 ```bash
 cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?" --dangerous-sandbox-mode
@@ -85,7 +91,8 @@ Or choose a custom bind address:
 cargo run -p odyssey-rs -- serve --bind 127.0.0.1:8472
 ```
 
-The server exposes bundle and session APIs over HTTP. The CLI can target that server with `--remote` for the subset of commands that support remote execution:
+The server exposes bundle and session APIs over HTTP. The CLI can target that server with
+`--remote` for the subset of commands that support remote execution:
 
 ```bash
 cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 bundles
@@ -94,7 +101,7 @@ cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 run hello-world@latest
 
 ## Start The TUI
 
-The TUI embeds the runtime directly.
+The TUI embeds the runtime directly:
 
 ```bash
 cargo run -p odyssey-rs-tui -- --bundle hello-world@latest

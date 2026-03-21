@@ -1,7 +1,0 @@
-[book]
-title = "Odyssey"
-language = "en"
-src = "src"
-
-[build]
-build-dir = "book"

@@ -1,0 +1,56 @@
+---
+id: index
+title: Odyssey Documentation
+slug: /
+description: Product documentation for Odyssey, the portable Rust runtime for bundle-first AI agents.
+---
+
+# Odyssey Documentation
+
+Odyssey is a bundle-first runtime for packaging, securing, and executing AI agents. It provides a single execution contract across CLI, TUI, HTTP, and embedded Rust usage.
+
+## Getting Started
+
+Install and run your first agent in minutes. See the [Getting Started](/getting-started/) guide for the full bundle workflow.
+
+```bash
+cargo run -p odyssey-rs -- init ./hello-world
+```
+
+## Workspace Crates
+
+| Crate | Purpose |
+| --- | --- |
+| `odyssey-rs-manifest` | Parses and validates bundle manifests and agent specs |
+| `odyssey-rs-bundle` | Builds, installs, exports, imports, publishes, and pulls bundles |
+| `odyssey-rs-runtime` | Owns sessions, sandbox preparation, tool routing, approvals, prompt assembly, and execution |
+| `odyssey-rs-tools` | Provides the builtin tool set |
+| `odyssey-rs-sandbox` | Provides host and Linux sandbox backends |
+| `odyssey-rs-server` | HTTP surface over the runtime |
+| `odyssey-rs` | CLI surface |
+| `odyssey-rs-tui` | Terminal UI surface |
+
+## What You Can Do Today
+
+- Author local bundles and install them into the bundle store.
+- Export and import portable `.odyssey` archives.
+- Run agents through the CLI, HTTP server, or TUI.
+- Persist sessions locally and stream execution events.
+- Gate tool calls through sandbox policy and approvals.
+- Integrate the runtime directly from Rust.
+
+## Current Limits
+
+- Manifest validation currently accepts prebuilt executors only; `react` is the executor wired into the runtime.
+- Manifest validation currently accepts prebuilt memory providers only; `sliding_window` is the implemented provider.
+- Manifest validation currently accepts builtin tools only.
+- Cloud LLM providers are implemented today; local model support is planned.
+
+## Further Reading
+
+- [Getting Started](/getting-started/) — Bundle lifecycle walkthrough
+- [Bundle Format](/bundle-format/) — Manifest schema and build outputs
+- [Sandbox and Tools](/sandbox-and-tools/) — Runtime safety and builtin tools
+- [Runtime Model](/runtime-model/) — Execution flow and events
+- [Runtime Architecture](/architecture/) — System design and transport surfaces
+- [docs.rs](https://docs.rs/releases/search?query=odyssey-rs) — Crate-level API reference
