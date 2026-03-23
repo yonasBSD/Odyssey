@@ -10,47 +10,10 @@ git pull origin main
 git checkout -b feature/vx.x.x
 ```
 
-2. Update the workspace version in `Cargo.toml`.
-   Update:
-   - `[workspace.package].version`
-   - every Odyssey crate version in `[workspace.dependencies]`
-
-   We use SemVer versions.
-
-3. Update release-facing docs for the new version if needed.
-   If the release changes a public API, update the relevant docs under `docs/`.
-
-4. Run the release checks before opening the PR:
-
-```shell
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --all-features
-```
-
-5. Commit the release changes on the release branch:
-
 ```shell
 git add .
 git commit -m "[MAINT]: bump version to x.x.x"
 git push origin feature/vx.x.x
-```
-
-6. Open a PR from `feature/vx.x.x` to `main`, wait for CI to pass, and get it reviewed.
-
-7. Merge the PR to `main`.
-
-8. After the PR is merged, switch back to `main` and pull the merged commit that will be released:
-
-```shell
-git checkout main
-git pull origin main
-```
-
-9. Make sure you are authenticated with crates.io:
-
-```shell
-cargo login
 ```
 
 10. Publish to crates.io from `main` and MAINTAIN the order below.
@@ -117,6 +80,9 @@ cargo publish
 
 ```shell
 cd ../..
+git push -u origin feature/v.x.x
+git checkout main
+git pull
 git tag -a vx.x.x -m "Release vx.x.x
 
 Features:
