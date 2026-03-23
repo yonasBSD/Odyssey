@@ -1,12 +1,13 @@
 mod build;
 mod client;
+mod constants;
 mod distribution;
 mod error;
-mod inspect;
 mod layout;
-mod reference;
+mod store;
+#[doc(hidden)]
+pub mod test_support;
 
 pub use build::{BundleArtifact, BundleBuilder, BundleMetadata, BundleProject};
 pub use error::BundleError;
-pub use inspect::inspect_bundle;
-pub use reference::{BundleInstall, BundleInstallSummary, BundleStore};
+pub use store::{BundleInstall, BundleInstallSummary, BundleStore};

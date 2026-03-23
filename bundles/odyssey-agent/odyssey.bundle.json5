@@ -1,48 +1,36 @@
 {
   id: 'odyssey-agent',
   version: '0.1.0',
+  manifest_version: "odyssey.bundle/v1",
+  readme: "README.md",
   agent_spec: 'agent.yaml',
   executor: { type: 'prebuilt', id: 'react' },
-  memory: {
-    provider: { type: 'prebuilt', id: 'sliding_window' },
-    config: { max_window: 100 }
-  },
+  memory: { type: 'prebuilt', id: 'sliding_window', config: { max_window: 100 } },
   skills: [
     { name: 'weather', path: 'skills/weather' }
   ],
-  resources: [],
   tools: [
     { name: 'Read', source: 'builtin' },
     { name: 'Write', source: 'builtin' },
     { name: 'Edit', source: 'builtin' },
+    { name: 'LS', source: 'builtin' },
     { name: 'Glob', source: 'builtin' },
     { name: 'Grep', source: 'builtin' },
     { name: 'Bash', source: 'builtin' },
     { name: 'Skill', source: 'builtin' }
   ],
-  server: { enable_http: true },
   sandbox: {
     mode: 'workspace_write',
+    env: {},
     permissions: {
       filesystem: {
         exec: [],
-        mounts: { read: [], write: [] }
+        mounts: { read: ["."], write: [] } //This mounts the current working workspace
       },
-      network: [],
-      tools: {
-        mode: 'default',
-        rules: [
-          { action: 'allow', tool: 'Read' },
-          { action: 'allow', tool: 'Glob' },
-          { action: 'allow', tool: 'Grep' },
-          { action: 'allow', tool: 'Skill' },
-          { action: 'ask', tool: 'Write' },
-          { action: 'ask', tool: 'Edit' },
-          { action: 'ask', tool: 'Bash' }
-        ]
-      }
+      network: ["*"]
     },
-    system_tools: ['bash'],
-    resources: { cpu: 1, memory_mb: 512, gpu: 0 }
+    system_tools_mode: 'standard',
+    system_tools: [],
+    resources: { cpu: 1, memory_mb: 512 }
   }
 }

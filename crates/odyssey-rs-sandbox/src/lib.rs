@@ -8,16 +8,16 @@ pub use error::SandboxError;
 pub use odyssey_rs_protocol::SandboxMode;
 pub use provider::{
     CommandOutputSink, DependencyReport, SandboxProvider, local::HostExecProvider,
-    local::LocalSandboxProvider, resolve_internal_landlock_helper_path,
+    local::LocalSandboxProvider, standard_system_exec_roots,
 };
 pub use runner::SandboxRunner;
 pub use runtime::{
-    SandboxCellKey, SandboxCellKind, SandboxCellLease, SandboxCellRoot, SandboxCellSpec,
-    SandboxExecutionLayout, SandboxRuntime,
+    SandboxCellKey, SandboxCellKind, SandboxCellLease, SandboxCellSpec, SandboxExecutionLayout,
+    SandboxRuntime,
 };
 pub use types::{
-    AccessDecision, AccessMode, CommandLandlockPolicy, CommandResult, CommandSpec, SandboxContext,
-    SandboxEnvPolicy, SandboxFilesystemPolicy, SandboxHandle, SandboxLimits, SandboxNetworkMode,
+    AccessDecision, AccessMode, CommandResult, CommandSpec, SandboxContext, SandboxEnvPolicy,
+    SandboxFilesystemPolicy, SandboxHandle, SandboxLimits, SandboxMountBinding, SandboxNetworkMode,
     SandboxNetworkPolicy, SandboxPolicy, SandboxRunRequest, SandboxRunResult, SandboxSupport,
 };
 

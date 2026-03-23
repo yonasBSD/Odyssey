@@ -1,10 +1,10 @@
 //! Reusable library API for launching the Odyssey Ratatui client.
 
 mod app;
-pub mod cli;
 mod client;
 mod event;
 mod handlers;
+pub mod history;
 mod spawn;
 mod terminal;
 mod tui_config;
@@ -27,21 +27,13 @@ use tokio::task::JoinHandle;
 pub struct TuiRunConfig {
     /// Bundle reference used for all sessions in the UI.
     pub bundle_ref: String,
-    /// Optional user name shown in the header.
-    pub user_name: Option<String>,
     /// Optional working directory shown in the header.
     pub cwd: Option<PathBuf>,
 }
 
-pub const DEFAULT_BUNDLE_REF: &str = "odyssey@latest";
-
 /// Launch the Odyssey TUI against a pre-configured [`OdysseyRuntime`].
 pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::Result<()> {
-    let TuiRunConfig {
-        bundle_ref,
-        user_name,
-        cwd,
-    } = config;
+    let TuiRunConfig { bundle_ref, cwd } = config;
     let cwd = cwd
         .clone()
         .or_else(|| std::env::current_dir().ok())
@@ -61,7 +53,7 @@ pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::
         app.set_bundles(bundles);
     }
 
-    app.set_user_name(user_name.unwrap_or_else(terminal::resolve_user_name));
+    app.set_user_name(terminal::resolve_user_name());
     app.cwd = cwd.display().to_string();
     if app.bundle_ref.is_empty() {
         app.open_viewer(app::ViewerKind::Bundles);
@@ -99,14 +91,6 @@ pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::
     spawn::spawn_tick(tx.clone());
 
     let mut stream_handle: Option<JoinHandle<()>> = None;
-    if !app.bundle_ref.is_empty()
-        && app.active_session.is_none()
-        && let Err(err) =
-            handlers::session::create_session(&client, &mut app, tx.clone(), &mut stream_handle)
-                .await
-    {
-        app.push_status(format!("failed to initialize session: {err}"));
-    }
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -132,9 +116,6 @@ pub fn resolve_bundle_ref(
     if let Some(bundle_ref) = requested.filter(|bundle| !bundle.trim().is_empty()) {
         return Ok(bundle_ref);
     }
-    if bundles.resolve(DEFAULT_BUNDLE_REF).is_ok() {
-        return Ok(DEFAULT_BUNDLE_REF.to_string());
-    }
 
     Ok(bundles
         .list_installed()?
@@ -150,7 +131,7 @@ fn bundle_summary_ref(bundle: BundleInstallSummary) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BUNDLE_REF, TuiRunConfig, bundle_summary_ref, resolve_bundle_ref};
+    use super::{TuiRunConfig, bundle_summary_ref, resolve_bundle_ref};
     use odyssey_rs_bundle::BundleInstallSummary;
     use odyssey_rs_runtime::{RuntimeConfig, RuntimeEngine};
     use pretty_assertions::assert_eq;
@@ -173,25 +154,24 @@ mod tests {
 
     fn write_bundle_project(root: &Path, bundle_id: &str) {
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
-        fs::create_dir_all(root.join("data")).expect("create data dir");
+        fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
         fs::write(
             root.join("odyssey.bundle.json5"),
             format!(
                 r#"{{
                     id: "{bundle_id}",
                     version: "0.1.0",
+                    manifest_version: "odyssey.bundle/v1",
+                    readme: "README.md",
                     agent_spec: "agent.yaml",
                     executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ provider: {{ type: "prebuilt", id: "sliding_window" }} }},
-                    resources: ["data"],
+                    memory: {{ type: "prebuilt", id: "sliding_window" }},
                     skills: [{{ name: "repo-hygiene", path: "skills/repo-hygiene" }}],
                     tools: [{{ name: "Read", source: "builtin" }}],
-                    server: {{ enable_http: true }},
                     sandbox: {{
                         permissions: {{
                             filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: [],
-                            tools: {{ mode: "default", rules: [] }}
+                            network: []
                         }},
                         system_tools: [],
                         resources: {{}}
@@ -211,17 +191,21 @@ model:
   name: gpt-4.1-mini
 tools:
   allow: ["Read", "Skill"]
-  deny: []
 "#
             ),
         )
         .expect("write agent");
+        fs::write(root.join("README.md"), format!("# {bundle_id}\n")).expect("write readme");
         fs::write(
             root.join("skills").join("repo-hygiene").join("SKILL.md"),
             "# Repo Hygiene\n\nKeep commits focused.\n",
         )
         .expect("write skill");
-        fs::write(root.join("data").join("notes.txt"), "hello world\n").expect("write resource");
+        fs::write(
+            root.join("resources").join("data").join("notes.txt"),
+            "hello world\n",
+        )
+        .expect("write resource");
     }
 
     #[test]
@@ -247,10 +231,6 @@ tools:
         runtime
             .build_and_install(&odyssey_project)
             .expect("install odyssey");
-        assert_eq!(
-            resolve_bundle_ref(&runtime, None).expect("default bundle"),
-            DEFAULT_BUNDLE_REF
-        );
 
         let temp = tempdir().expect("tempdir");
         let runtime = RuntimeEngine::new(runtime_config(temp.path())).expect("runtime");

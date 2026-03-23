@@ -5,7 +5,11 @@ use log::info;
 use odyssey_rs_bundle::{BundleBuilder, BundleProject, BundleStore};
 use odyssey_rs_protocol::{ExecutionRequest, SandboxMode, SessionSpec, Task};
 use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
-use std::path::{Path, PathBuf};
+use odyssey_rs_tui::{TuiRunConfig, resolve_bundle_ref};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -34,6 +38,7 @@ pub enum Command {
     Inspect { reference: String },
     #[command(about = "Run an Odyssey agent bundle")]
     Run {
+        #[arg(help = "The bundle reference")]
         reference: String,
         #[arg(long)]
         prompt: String,
@@ -81,6 +86,17 @@ pub enum Command {
         id: Uuid,
         #[arg(long)]
         delete: bool,
+    },
+    #[command(about = "Run the TUI")]
+    Tui {
+        /// Bundle reference to run, such as `hello-world@latest`.
+        #[arg(long, short = 'b')]
+        bundle: Option<String>,
+        /// Optional working directory label shown in the header.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        dangerous_sandbox_mode: bool,
     },
 }
 
@@ -132,6 +148,9 @@ fn dangerous_sandbox_mode_enabled(command: &Command) -> bool {
         } | Command::Serve {
             dangerous_sandbox_mode: true,
             ..
+        } | Command::Tui {
+            dangerous_sandbox_mode: true,
+            ..
         }
     )
 }
@@ -177,6 +196,7 @@ async fn execute_command(
         Command::Bundles => handle_bundles(bundles, remote).await,
         Command::Sessions => handle_sessions(runtime, remote).await,
         Command::Session { id, delete } => handle_session(runtime, remote, id, delete).await,
+        Command::Tui { bundle, cwd, .. } => handle_tui(bundle, cwd, runtime).await,
     }
 }
 
@@ -377,7 +397,7 @@ async fn handle_session(
         if let Some(remote) = remote {
             remote.delete_session(id).await?;
         } else {
-            runtime.delete_session(id)?;
+            runtime.delete_session(id).await?;
         }
         println!("{} {}", "deleted".green().bold(), id);
     } else {
@@ -388,6 +408,19 @@ async fn handle_session(
         };
         println!("{}", serde_json::to_string_pretty(&session)?);
     }
+    Ok(())
+}
+
+async fn handle_tui(
+    bundle: Option<String>,
+    cwd: Option<PathBuf>,
+    runtime: &OdysseyRuntime,
+) -> Result<()> {
+    let _ = env_logger::builder().format_timestamp_millis().try_init();
+    let bundle_ref = resolve_bundle_ref(runtime, bundle)?;
+    let runtime = Arc::new(runtime.clone());
+
+    odyssey_rs_tui::run(runtime, TuiRunConfig { bundle_ref, cwd }).await?;
     Ok(())
 }
 
@@ -455,7 +488,9 @@ fn default_bundle_id(root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_bundle_id;
+    use super::{Cli, Command, build_runtime_config, default_bundle_id};
+    use clap::Parser;
+    use odyssey_rs_protocol::SandboxMode;
     use pretty_assertions::assert_eq;
     use std::path::Path;
 
@@ -464,6 +499,41 @@ mod tests {
         assert_eq!(
             default_bundle_id(Path::new("./bundles/My Starter Agent")),
             "my-starter-agent"
+        );
+    }
+
+    #[test]
+    fn tui_cli_accepts_dangerous_sandbox_mode_flag() {
+        let cli = Cli::parse_from([
+            "odyssey-rs",
+            "tui",
+            "--bundle",
+            "local/demo@0.1.0",
+            "--dangerous-sandbox-mode",
+        ]);
+
+        match cli.command {
+            Command::Tui {
+                bundle,
+                dangerous_sandbox_mode,
+                ..
+            } => {
+                assert_eq!(bundle, Some("local/demo@0.1.0".to_string()));
+                assert!(dangerous_sandbox_mode);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tui_dangerous_sandbox_mode_overrides_runtime_config() {
+        let cli = Cli::parse_from(["odyssey-rs", "tui", "--dangerous-sandbox-mode"]);
+
+        let config = build_runtime_config(&cli);
+
+        assert_eq!(
+            config.sandbox_mode_override,
+            Some(SandboxMode::DangerFullAccess)
         );
     }
 }

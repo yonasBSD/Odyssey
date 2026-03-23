@@ -20,11 +20,11 @@ pub use autoagents_protocol::Task;
 pub use autoagents_protocol::{Event as AutoAgentsEvent, StreamChunk as AutoAgentsStreamChunk};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct AgentRef {
+pub struct BundleRef {
     pub reference: String,
 }
 
-impl AgentRef {
+impl BundleRef {
     pub fn new(reference: impl Into<String>) -> Self {
         Self {
             reference: reference.into(),
@@ -36,19 +36,19 @@ impl AgentRef {
     }
 }
 
-impl From<String> for AgentRef {
+impl From<String> for BundleRef {
     fn from(value: String) -> Self {
         Self::new(value)
     }
 }
 
-impl From<&str> for AgentRef {
+impl From<&str> for BundleRef {
     fn from(value: &str) -> Self {
         Self::new(value)
     }
 }
 
-impl std::fmt::Display for AgentRef {
+impl std::fmt::Display for BundleRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.reference)
     }
@@ -80,8 +80,7 @@ pub struct SessionSummary {
 pub struct Session {
     pub id: SessionId,
     pub agent_id: String,
-    #[serde(alias = "bundle_ref")]
-    pub agent_ref: String,
+    pub bundle_ref: String,
     pub model_id: String,
     pub created_at: DateTime<Utc>,
     pub messages: Vec<Message>,
@@ -89,7 +88,7 @@ pub struct Session {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSpec {
-    pub agent_ref: AgentRef,
+    pub bundle_ref: BundleRef,
     #[serde(default)]
     pub model: Option<ModelSpec>,
     #[serde(default = "empty_json_object")]
@@ -99,13 +98,13 @@ pub struct SessionSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionFilter {
     #[serde(default)]
-    pub agent_ref: Option<AgentRef>,
+    pub bundle_ref: Option<BundleRef>,
 }
 
 impl From<&str> for SessionSpec {
     fn from(value: &str) -> Self {
         Self {
-            agent_ref: AgentRef::from(value),
+            bundle_ref: BundleRef::from(value),
             model: None,
             metadata: empty_json_object(),
         }
@@ -273,23 +272,6 @@ impl TurnContext {
         if override_ctx.model.is_some() {
             self.model = override_ctx.model.clone();
         }
-        if override_ctx.sandbox_mode.is_some() {
-            self.sandbox_mode = override_ctx.sandbox_mode;
-        }
-        if override_ctx.approval_policy.is_some() {
-            self.approval_policy = override_ctx.approval_policy;
-        }
-        let Some(override_map) = override_ctx.metadata.as_object() else {
-            return;
-        };
-        if override_map.is_empty() {
-            return;
-        }
-        if let Some(target) = self.metadata.as_object_mut() {
-            target.extend(override_map.clone());
-        } else {
-            self.metadata.clone_from(&override_ctx.metadata);
-        }
     }
 }
 
@@ -299,12 +281,6 @@ pub struct TurnContextOverride {
     pub cwd: Option<String>,
     #[serde(default)]
     pub model: Option<ModelSpec>,
-    #[serde(default)]
-    pub sandbox_mode: Option<SandboxMode>,
-    #[serde(default)]
-    pub approval_policy: Option<ApprovalPolicy>,
-    #[serde(default = "empty_json_object")]
-    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,7 +358,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn turn_context_override_merges_metadata() {
+    fn turn_context_override() {
         let mut ctx = TurnContext {
             cwd: Some("/workspace".to_string()),
             model: Some(ModelSpec {
@@ -396,15 +372,12 @@ mod tests {
         };
         let override_ctx = TurnContextOverride {
             cwd: Some("/override".to_string()),
-            approval_policy: Some(ApprovalPolicy::Never),
-            metadata: json!({ "extra": true }),
             ..TurnContextOverride::default()
         };
         ctx.apply_override(&override_ctx);
 
         assert_eq!(ctx.cwd, Some("/override".to_string()));
-        assert_eq!(ctx.approval_policy, Some(ApprovalPolicy::Never));
-        assert_eq!(ctx.metadata, json!({ "existing": 1, "extra": true }));
+        assert_eq!(ctx.approval_policy, Some(ApprovalPolicy::OnRequest));
     }
 
     #[test]

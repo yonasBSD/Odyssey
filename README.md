@@ -84,8 +84,8 @@ At execution time, Odyssey resolves an `AgentRef` to an installed bundle, create
 The same runtime is available through:
 
 - `odyssey-rs` for CLI workflows
+- `odyssey-rs` `tui` for terminal-native operation
 - `odyssey-rs-server` for HTTP access
-- `odyssey-rs-tui` for terminal-native operation
 
 ## Quickstart
 
@@ -102,6 +102,10 @@ This creates a starter project with:
 - `README.md`
 - `skills/`
 - `resources/`
+
+The starter template currently uses the `react` executor, `sliding_window` memory, all builtin
+tools, and a development-friendly sandbox policy. Tighten the bundle manifest before production
+use.
 
 ### 2. Build and install locally
 
@@ -121,11 +125,12 @@ cargo run -p odyssey-rs -- build ./hello-world --output ./dist
 export OPENAI_API_KEY="your-key"
 cargo run -p odyssey-rs -- run hello-world@latest --prompt "Hey, What are your capabilities?"
 ```
-Run the agent in the TUI - The TUI Automatically loads the installed bundles, TUI Gives ability to run tools with "ASK" policy
+Run the agent in the TUI. The TUI automatically loads installed bundles and handles tools with
+`ASK` policy through the same `odyssey-rs` CLI entrypoint.
 
 ```bash
 export OPENAI_API_KEY="your-key"
-cargo run --release -p odyssey-rs-tui
+cargo run --release -p odyssey-rs -- tui --bundle hello-world@latest
 ```
 
 ### 4. Inspect installed metadata
@@ -151,7 +156,10 @@ cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 sessions
 
 ## Docker on macOS
 
-Odyssey's confined sandbox backend is Linux-only today. If you are developing on macOS and want to run the current system with the Linux `bubblewrap` sandbox instead of host fallback mode, use the included Docker image.
+Odyssey's confined sandbox backend is Linux-only today. On macOS and Windows, `read_only` and
+`workspace_write` bundle sandboxes require a Linux environment. If you want the current
+`bubblewrap`-based sandbox on macOS, use the included Docker image. If you only need local host
+execution, use `--dangerous-sandbox-mode` instead.
 
 Build the image:
 
@@ -210,6 +218,7 @@ Odyssey treats execution policy as part of the runtime contract.
 
 - Bundles declare a sandbox mode such as `read_only` or `workspace_write`.
 - Tool actions can be set to `allow`, `deny`, or `ask`.
+- Tool permissions can be coarse (`Bash`) or granular (`Bash(cargo test:*)`).
 - Filesystem access is controlled through explicit host mounts.
 - Outbound network access is controlled through sandbox policy.
 - Approval flows suspend the active turn and resume it after resolution.
@@ -218,7 +227,7 @@ For local debugging, the CLI and server support `--dangerous-sandbox-mode`, whic
 
 ## Repository Layout
 
-- `crates/odyssey-rs`: CLI entrypoint and facade crate
+- `crates/odyssey-rs`: CLI entrypoint and facade crate, including the `tui` command
 - `crates/odyssey-rs-manifest`: bundle manifest parsing and validation
 - `crates/odyssey-rs-bundle`: build, install, inspect, export, import, push, and pull
 - `crates/odyssey-rs-protocol`: shared runtime protocol types
@@ -226,7 +235,7 @@ For local debugging, the CLI and server support `--dangerous-sandbox-mode`, whic
 - `crates/odyssey-rs-tools`: built-in tools and tool adaptors
 - `crates/odyssey-rs-sandbox`: sandbox runtime and providers
 - `crates/odyssey-rs-server`: Axum-based HTTP API
-- `crates/odyssey-rs-tui`: Ratatui-based terminal UI
+- `crates/odyssey-rs-tui`: Ratatui-based terminal UI implementation used by `odyssey-rs tui`
 - `bundles/hello-world`: minimal example bundle
 - `bundles/odyssey-agent`: Odyssey general purpose agent
 
@@ -255,10 +264,7 @@ cargo tarpaulin --engine llvm --skip-clean --workspace --all-features --timeout 
 
 ## Documentation
 
-- [Docs index](docs/README.md)
-- [Runtime architecture](docs/architecture-runtime.md)
-- [Hello world bundle](bundles/hello-world/README.md)
-- [Odyssey agent bundle](bundles/odyssey-agent/README.md)
+- [Documentation site](https://liquidos-ai.github.io/Odyssey/)
 
 ## Contributing
 

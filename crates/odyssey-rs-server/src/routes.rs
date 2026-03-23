@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use odyssey_rs_protocol::{AgentRef, ExecutionRequest, SessionSpec};
+use odyssey_rs_protocol::{BundleRef, ExecutionRequest, SessionSpec};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -150,7 +150,7 @@ async fn create_session(
     let session = state
         .runtime
         .create_session(SessionSpec {
-            agent_ref: AgentRef::from(request.agent_ref),
+            bundle_ref: BundleRef::from(request.bundle_ref),
             model: request.model,
             metadata: json!({}),
         })
@@ -183,7 +183,7 @@ async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.runtime.delete_session(id).map_err(internal)?;
+    state.runtime.delete_session(id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -276,24 +276,23 @@ mod tests {
 
     fn write_bundle_project(root: &Path) {
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
-        fs::create_dir_all(root.join("data")).expect("create data dir");
+        fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
         fs::write(
             root.join("odyssey.bundle.json5"),
             r#"{
                 id: "demo",
                 version: "0.1.0",
+                manifest_version: "odyssey.bundle/v1",
+                readme: "README.md",
                 agent_spec: "agent.yaml",
                 executor: { type: "prebuilt", id: "react" },
-                memory: { provider: { type: "prebuilt", id: "sliding_window" } },
-                resources: ["data"],
+                memory: { type: "prebuilt", id: "sliding_window" },
                 skills: [{ name: "repo-hygiene", path: "skills/repo-hygiene" }],
                 tools: [{ name: "Read", source: "builtin" }],
-                server: { enable_http: true },
                 sandbox: {
                     permissions: {
                         filesystem: { exec: [], mounts: { read: [], write: [] } },
-                        network: [],
-                        tools: { mode: "default", rules: [] }
+                        network: []
                     },
                     system_tools: [],
                     resources: {}
@@ -311,16 +310,20 @@ model:
   name: gpt-4.1-mini
 tools:
   allow: ["Read", "Skill"]
-  deny: []
 "#,
         )
         .expect("write agent");
+        fs::write(root.join("README.md"), "# demo\n").expect("write readme");
         fs::write(
             root.join("skills").join("repo-hygiene").join("SKILL.md"),
             "# Repo Hygiene\n",
         )
         .expect("write skill");
-        fs::write(root.join("data").join("notes.txt"), "hello world\n").expect("write resource");
+        fs::write(
+            root.join("resources").join("data").join("notes.txt"),
+            "hello world\n",
+        )
+        .expect("write resource");
     }
 
     fn runtime_config(root: &Path) -> RuntimeConfig {
@@ -446,7 +449,7 @@ tools:
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
-                        "agent_ref": "demo@0.1.0"
+                        "bundle_ref": "demo@0.1.0"
                     }))
                     .expect("serialize session request"),
                 ))
@@ -468,7 +471,7 @@ tools:
         )
         .await;
         assert_eq!(fetched["id"], session_id);
-        assert_eq!(fetched["agent_ref"], "demo@0.1.0");
+        assert_eq!(fetched["bundle_ref"], "demo@0.1.0");
 
         let resolved = json_response(
             app.clone(),

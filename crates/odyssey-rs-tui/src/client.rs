@@ -5,10 +5,10 @@ use anyhow::Result;
 use log::info;
 use odyssey_rs_bundle::{BundleInstallSummary, BundleMetadata, BundleStore};
 use odyssey_rs_protocol::{
-    AgentRef, ApprovalDecision, ExecutionRequest, Session, SessionFilter, SessionSpec,
+    ApprovalDecision, BundleRef, ExecutionRequest, Session, SessionFilter, SessionSpec,
     SessionSummary, SkillSummary, Task,
 };
-use odyssey_rs_runtime::{OdysseyRuntime, RunOutput};
+use odyssey_rs_runtime::{OdysseyRuntime, RunOutput, SessionCommandOutput};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -67,7 +67,7 @@ impl AgentRuntimeClient {
     /// List available sessions.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         Ok(self.runtime.list_sessions(Some(&SessionFilter {
-            agent_ref: Some(AgentRef::from(self.bundle_ref())),
+            bundle_ref: Some(BundleRef::from(self.bundle_ref())),
         })))
     }
 
@@ -109,6 +109,18 @@ impl AgentRuntimeClient {
                 input: task,
                 turn_context: None,
             })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Execute a direct process invocation in the current session sandbox.
+    pub async fn run_session_command(
+        &self,
+        session_id: Uuid,
+        command_line: impl AsRef<str>,
+    ) -> Result<SessionCommandOutput> {
+        self.runtime
+            .run_session_command(session_id, command_line)
             .await
             .map_err(Into::into)
     }
@@ -195,25 +207,24 @@ mod tests {
         skill_description: &str,
     ) {
         fs::create_dir_all(root.join("skills").join(skill_name)).expect("create skill dir");
-        fs::create_dir_all(root.join("data")).expect("create data dir");
+        fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
         fs::write(
             root.join("odyssey.bundle.json5"),
             format!(
                 r#"{{
                     id: "{bundle_id}",
                     version: "0.1.0",
+                    manifest_version: "odyssey.bundle/v1",
+                    readme: "README.md",
                     agent_spec: "agent.yaml",
                     executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ provider: {{ type: "prebuilt", id: "sliding_window" }} }},
-                    resources: ["data"],
+                    memory: {{ type: "prebuilt", id: "sliding_window" }},
                     skills: [{{ name: "{skill_name}", path: "skills/{skill_name}" }}],
                     tools: [{{ name: "Read", source: "builtin" }}],
-                    server: {{ enable_http: true }},
                     sandbox: {{
                         permissions: {{
                             filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: [],
-                            tools: {{ mode: "default", rules: [] }}
+                            network: ["*"]
                         }},
                         system_tools: [],
                         resources: {{}}
@@ -233,17 +244,21 @@ model:
   name: {model_name}
 tools:
   allow: ["Read", "Skill"]
-  deny: []
 "#
             ),
         )
         .expect("write agent");
+        fs::write(root.join("README.md"), format!("# {bundle_id}\n")).expect("write readme");
         fs::write(
             root.join("skills").join(skill_name).join("SKILL.md"),
             format!("# {skill_name}\n\n{skill_description}\n"),
         )
         .expect("write skill");
-        fs::write(root.join("data").join("notes.txt"), "hello world\n").expect("write resource");
+        fs::write(
+            root.join("resources").join("data").join("notes.txt"),
+            "hello world\n",
+        )
+        .expect("write resource");
     }
 
     #[tokio::test]
@@ -361,7 +376,7 @@ tools:
         assert_eq!(sessions[0].agent_id, "alpha-agent");
 
         let session = client.get_session(session_id).await.expect("get session");
-        assert_eq!(session.agent_ref, "local/alpha@0.1.0");
+        assert_eq!(session.bundle_ref, "local/alpha@0.1.0");
         assert_eq!(session.agent_id, "alpha-agent");
         assert!(session.messages.is_empty());
 
@@ -382,5 +397,34 @@ tools:
                 .await
                 .expect("resolve unknown request")
         );
+    }
+
+    #[tokio::test]
+    async fn client_runs_direct_session_commands() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(
+            &project,
+            "alpha",
+            "alpha-agent",
+            "gpt-4.1-mini",
+            "repo-hygiene",
+            "Keep commits focused.",
+        );
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let client = AgentRuntimeClient::new(runtime, "local/alpha@0.1.0".to_string());
+        let session_id = client.create_session(None).await.expect("create session");
+        let output = client
+            .run_session_command(session_id, "printf client-direct")
+            .await
+            .expect("run session command");
+
+        assert_eq!(output.session_id, session_id);
+        assert_eq!(output.stdout, "client-direct");
+        assert_eq!(output.stderr, "");
+        assert_eq!(output.status_code, Some(0));
     }
 }

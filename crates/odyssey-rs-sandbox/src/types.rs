@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// Filesystem operation being authorized by a sandbox provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
     Read,
@@ -10,12 +11,14 @@ pub enum AccessMode {
     Execute,
 }
 
+/// Result returned by sandbox access checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDecision {
     Allow,
     Deny(String),
 }
 
+/// Input used to prepare a provider-specific sandbox handle.
 #[derive(Debug, Clone)]
 pub struct SandboxContext {
     pub workspace_root: PathBuf,
@@ -23,11 +26,13 @@ pub struct SandboxContext {
     pub policy: SandboxPolicy,
 }
 
+/// Opaque identifier for a prepared sandbox instance.
 #[derive(Debug, Clone)]
 pub struct SandboxHandle {
     pub id: Uuid,
 }
 
+/// Complete sandbox policy applied to a command execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPolicy {
     pub filesystem: SandboxFilesystemPolicy,
@@ -36,19 +41,32 @@ pub struct SandboxPolicy {
     pub limits: SandboxLimits,
 }
 
+/// Filesystem allowlists and bind mounts exposed to the sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxFilesystemPolicy {
     pub read_roots: Vec<String>,
     pub write_roots: Vec<String>,
     pub exec_roots: Vec<String>,
+    pub exec_allow_all: bool,
+    pub mount_bindings: Vec<SandboxMountBinding>,
 }
 
+/// Explicit host-to-sandbox bind mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMountBinding {
+    pub source: String,
+    pub target: String,
+    pub writable: bool,
+}
+
+/// Environment variables inherited or injected into the sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxEnvPolicy {
     pub inherit: Vec<String>,
     pub set: BTreeMap<String, String>,
 }
 
+/// Network settings enforced by the active sandbox backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxNetworkPolicy {
     pub mode: SandboxNetworkMode,
@@ -62,6 +80,7 @@ impl Default for SandboxNetworkPolicy {
     }
 }
 
+/// Resource limits enforced for a single command invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxLimits {
     pub cpu_seconds: Option<u64>,
@@ -73,26 +92,20 @@ pub struct SandboxLimits {
     pub stderr_bytes: Option<usize>,
 }
 
+/// Simplified network policy supported by the current runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxNetworkMode {
     AllowAll,
     Disabled,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CommandLandlockPolicy {
-    pub read_roots: Vec<PathBuf>,
-    pub write_roots: Vec<PathBuf>,
-    pub exec_roots: Vec<PathBuf>,
-}
-
+/// Process specification executed inside the sandbox.
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
-    pub landlock: Option<CommandLandlockPolicy>,
 }
 
 impl CommandSpec {
@@ -102,11 +115,11 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
-            landlock: None,
         }
     }
 }
 
+/// Buffered output collected from a process execution.
 #[derive(Debug, Clone, Default)]
 pub struct CommandResult {
     pub status_code: Option<i32>,
@@ -116,6 +129,7 @@ pub struct CommandResult {
     pub stderr_truncated: bool,
 }
 
+/// Wrapper passed to [`crate::SandboxRunner`] and provider implementations.
 #[derive(Debug, Clone)]
 pub struct SandboxRunRequest {
     pub context: SandboxContext,
@@ -124,6 +138,7 @@ pub struct SandboxRunRequest {
 
 pub type SandboxRunResult = CommandResult;
 
+/// Availability report for a sandbox backend on the current machine.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxSupport {
     pub provider: String,
@@ -134,7 +149,7 @@ pub struct SandboxSupport {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandLandlockPolicy, CommandSpec, SandboxNetworkMode, SandboxNetworkPolicy};
+    use super::{CommandSpec, SandboxNetworkMode, SandboxNetworkPolicy};
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -145,15 +160,6 @@ mod tests {
         assert_eq!(spec.args.len(), 0);
         assert_eq!(spec.cwd, None);
         assert_eq!(spec.env.len(), 0);
-        assert_eq!(spec.landlock, None);
-    }
-
-    #[test]
-    fn landlock_policy_defaults_are_empty() {
-        let policy = CommandLandlockPolicy::default();
-        assert_eq!(policy.read_roots.len(), 0);
-        assert_eq!(policy.write_roots.len(), 0);
-        assert_eq!(policy.exec_roots.len(), 0);
     }
 
     #[test]

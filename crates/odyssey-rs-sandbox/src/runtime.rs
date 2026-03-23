@@ -4,29 +4,28 @@ use crate::{
     provider::{DependencyReport, canonicalize_existing_path, local::HostExecProvider},
 };
 use odyssey_rs_protocol::SandboxMode;
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// High-level buckets for runtime-managed sandbox cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxCellKind {
     Tooling,
-    Skill,
-    Mcp,
 }
 
 impl SandboxCellKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Tooling => "tooling",
-            Self::Skill => "skill",
-            Self::Mcp => "mcp",
         }
     }
 }
 
+/// Stable identity for a reusable sandbox cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SandboxCellKey {
     pub session_id: Option<Uuid>,
@@ -37,59 +36,49 @@ pub struct SandboxCellKey {
 
 impl SandboxCellKey {
     pub fn tooling(session_id: Uuid, agent_id: impl Into<String>) -> Self {
+        Self::tooling_component(session_id, agent_id, "tools")
+    }
+
+    pub fn tooling_component(
+        session_id: Uuid,
+        agent_id: impl Into<String>,
+        component_id: impl Into<String>,
+    ) -> Self {
         Self {
             session_id: Some(session_id),
             agent_id: agent_id.into(),
             kind: SandboxCellKind::Tooling,
-            component_id: "tools".to_string(),
+            component_id: component_id.into(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum SandboxCellRoot {
-    SharedWorkspace(PathBuf),
-    ManagedPrivate,
-}
-
+/// Runtime request used to create or reuse a managed sandbox cell.
 #[derive(Debug, Clone)]
 pub struct SandboxCellSpec {
     pub key: SandboxCellKey,
-    pub root: SandboxCellRoot,
+    pub cell_root: PathBuf,
     pub mode: SandboxMode,
     pub policy: SandboxPolicy,
 }
 
 impl SandboxCellSpec {
-    pub fn tooling(
-        session_id: Uuid,
-        agent_id: impl Into<String>,
-        workspace_root: PathBuf,
-        mode: SandboxMode,
-        policy: SandboxPolicy,
-    ) -> Self {
-        Self {
-            key: SandboxCellKey::tooling(session_id, agent_id),
-            root: SandboxCellRoot::SharedWorkspace(workspace_root),
-            mode,
-            policy,
-        }
-    }
-
     pub fn managed_component(
         key: SandboxCellKey,
+        cell_root: PathBuf,
         mode: SandboxMode,
         policy: SandboxPolicy,
     ) -> Self {
         Self {
             key,
-            root: SandboxCellRoot::ManagedPrivate,
+            cell_root,
             mode,
             policy,
         }
     }
 }
 
+/// Per-command layout created inside a managed cell.
 #[derive(Debug, Clone)]
 pub struct SandboxExecutionLayout {
     pub execution_id: Uuid,
@@ -100,17 +89,90 @@ pub struct SandboxExecutionLayout {
     pub tmp: PathBuf,
 }
 
+// Managed cells keep immutable staged bundle content separate from mutable state.
+// That lets restricted sandboxes keep `app/` read-only while still exposing private
+// locations for HOME, caches, temp files, and per-execution scratch data.
+#[derive(Debug, Clone)]
+struct ManagedCellLayout {
+    root: PathBuf,
+}
+
+impl ManagedCellLayout {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn app_dir(&self) -> PathBuf {
+        self.root.join("app")
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.root.join("data")
+    }
+
+    fn home_dir(&self) -> PathBuf {
+        self.data_dir().join("home")
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
+    fn tmp_dir(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
+    fn runs_dir(&self) -> PathBuf {
+        self.root.join("runs")
+    }
+
+    fn ensure(&self) -> Result<(), SandboxError> {
+        let _ = ensure_child_directory(self.root(), "app")?;
+        let data = ensure_child_directory(self.root(), "data")?;
+        let _ = ensure_child_directory(&data, "home")?;
+        let _ = ensure_child_directory(self.root(), "cache")?;
+        let _ = ensure_child_directory(self.root(), "tmp")?;
+        let _ = ensure_child_directory(self.root(), "runs")?;
+        Ok(())
+    }
+
+    fn begin_execution(&self, execution_id: Uuid) -> Result<SandboxExecutionLayout, SandboxError> {
+        let root = self.runs_dir().join(execution_id.to_string());
+        let inbox = root.join("inbox");
+        let outbox = root.join("outbox");
+        let work = root.join("work");
+        let tmp = root.join("tmp");
+
+        for dir in [&root, &inbox, &outbox, &work, &tmp] {
+            std::fs::create_dir_all(dir).map_err(SandboxError::Io)?;
+        }
+
+        Ok(SandboxExecutionLayout {
+            execution_id,
+            root,
+            inbox,
+            outbox,
+            work,
+            tmp,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SandboxCellState {
     key: SandboxCellKey,
     handle: SandboxHandle,
     workspace_root: PathBuf,
     cell_root: PathBuf,
-    managed_private: bool,
     mode: SandboxMode,
     policy: SandboxPolicy,
 }
 
+/// Active reference to a prepared sandbox cell.
 #[derive(Clone)]
 pub struct SandboxCellLease {
     provider: Arc<dyn SandboxProvider>,
@@ -147,44 +209,24 @@ impl SandboxCellLease {
     }
 
     pub fn data_dir(&self) -> PathBuf {
-        self.state.cell_root.join("data")
+        ManagedCellLayout::new(self.state.cell_root.clone()).data_dir()
     }
 
     pub fn cache_dir(&self) -> PathBuf {
-        self.state.cell_root.join("cache")
+        ManagedCellLayout::new(self.state.cell_root.clone()).cache_dir()
     }
 
     pub fn app_dir(&self) -> PathBuf {
-        self.state.cell_root.join("app")
+        ManagedCellLayout::new(self.state.cell_root.clone()).app_dir()
     }
 
     pub fn begin_execution(&self) -> Result<SandboxExecutionLayout, SandboxError> {
         let execution_id = Uuid::new_v4();
-        let root = self
-            .state
-            .cell_root
-            .join("runs")
-            .join(execution_id.to_string());
-        let inbox = root.join("inbox");
-        let outbox = root.join("outbox");
-        let work = root.join("work");
-        let tmp = root.join("tmp");
-
-        for dir in [&root, &inbox, &outbox, &work, &tmp] {
-            std::fs::create_dir_all(dir).map_err(SandboxError::Io)?;
-        }
-
-        Ok(SandboxExecutionLayout {
-            execution_id,
-            root,
-            inbox,
-            outbox,
-            work,
-            tmp,
-        })
+        ManagedCellLayout::new(self.state.cell_root.clone()).begin_execution(execution_id)
     }
 }
 
+/// Registry of prepared sandbox cells backed by a single provider implementation.
 pub struct SandboxRuntime {
     provider_name: String,
     provider: Arc<dyn SandboxProvider>,
@@ -205,6 +247,7 @@ impl SandboxRuntime {
         storage_root: PathBuf,
     ) -> Result<Self, SandboxError> {
         std::fs::create_dir_all(&storage_root).map_err(SandboxError::Io)?;
+        let storage_root = canonicalize_existing_path(&storage_root)?;
         Ok(Self {
             provider_name: provider_name.into(),
             provider,
@@ -259,60 +302,64 @@ impl SandboxRuntime {
 
     pub fn managed_cell_root(&self, key: &SandboxCellKey) -> Result<PathBuf, SandboxError> {
         let root = self.materialize_cell_root(key)?;
-        self.ensure_managed_cell_dirs(&root)?;
-        Ok(root)
+        self.ensure_managed_cell_dirs(&root)
     }
 
+    /// Create or reuse a managed sandbox cell for the given key and config.
+    ///
+    /// The runtime normalizes the managed layout under `cell_root`, augments the
+    /// policy with runtime-owned writable paths, and returns the existing cell
+    /// when the key has already been prepared with the same root, mode, and policy.
     pub async fn lease_cell(
         &self,
         spec: SandboxCellSpec,
     ) -> Result<Arc<SandboxCellLease>, SandboxError> {
-        let cell_root = self.materialize_cell_root(&spec.key)?;
-        let managed_private = matches!(&spec.root, SandboxCellRoot::ManagedPrivate);
-        let workspace_root = match &spec.root {
-            SandboxCellRoot::SharedWorkspace(path) => canonicalize_existing_path(path)?,
-            SandboxCellRoot::ManagedPrivate => {
-                self.ensure_managed_cell_dirs(&cell_root)?;
-                cell_root.clone()
-            }
-        };
+        let cell_root = self.ensure_managed_cell_dirs(&spec.cell_root)?;
+        let layout = ManagedCellLayout::new(cell_root.clone());
+        let workspace_root = canonicalize_existing_path(&layout.app_dir())?;
+        let policy = augment_managed_cell_policy(spec.mode, spec.policy.clone(), &layout);
 
-        let mut cells = self.cells.lock().await;
-        if let Some(state) = cells.get(&spec.key) {
-            if state.workspace_root != workspace_root
-                || state.cell_root != cell_root
-                || state.managed_private != managed_private
-                || state.mode != spec.mode
-                || state.policy != spec.policy
-            {
-                return Err(SandboxError::InvalidConfig(format!(
-                    "sandbox cell '{}' already exists with a different root, mode, or policy",
-                    spec.key.component_id
-                )));
-            }
-
+        if let Some(state) =
+            self.find_matching_cell(&spec.key, &workspace_root, &cell_root, spec.mode, &policy)?
+        {
             return Ok(Arc::new(SandboxCellLease {
                 provider: self.provider.clone(),
-                state: state.clone(),
+                state,
             }));
         }
 
         let context = SandboxContext {
             workspace_root: workspace_root.clone(),
             mode: spec.mode,
-            policy: spec.policy.clone(),
+            policy: policy.clone(),
         };
         let handle = self.provider.prepare(&context).await?;
-        let state = Arc::new(SandboxCellState {
+        let prepared_state = Arc::new(SandboxCellState {
             key: spec.key.clone(),
             handle,
             workspace_root,
             cell_root,
-            managed_private,
             mode: spec.mode,
-            policy: spec.policy,
+            policy,
         });
-        cells.insert(spec.key, state.clone());
+
+        let state = {
+            let mut cells = self.cells.lock();
+            if let Some(existing) = cells.get(&spec.key) {
+                self.validate_matching_cell(
+                    existing,
+                    &prepared_state.workspace_root,
+                    &prepared_state.cell_root,
+                    prepared_state.mode,
+                    &prepared_state.policy,
+                )?;
+                self.provider.shutdown(prepared_state.handle.clone());
+                existing.clone()
+            } else {
+                cells.insert(spec.key, prepared_state.clone());
+                prepared_state
+            }
+        };
 
         Ok(Arc::new(SandboxCellLease {
             provider: self.provider.clone(),
@@ -320,42 +367,223 @@ impl SandboxRuntime {
         }))
     }
 
-    pub async fn shutdown(&self) {
-        let mut cells = self.cells.lock().await;
+    pub fn shutdown(&self) {
+        let mut cells = self.cells.lock();
         let states = cells.drain().map(|(_, state)| state).collect::<Vec<_>>();
-        drop(cells);
         for state in states {
-            self.provider.shutdown(state.handle.clone()).await;
+            self.provider.shutdown(state.handle.clone());
         }
+    }
+
+    pub fn shutdown_session(&self, session_id: Uuid) -> Result<(), SandboxError> {
+        let states = {
+            let mut cells = self.cells.lock();
+            let keys = cells
+                .keys()
+                .filter(|key| key.session_id == Some(session_id))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            keys.into_iter()
+                .filter_map(|key| cells.remove(&key))
+                .collect::<Vec<_>>()
+        };
+
+        for state in states {
+            self.provider.shutdown(state.handle.clone());
+        }
+
+        self.remove_session_roots(session_id)
     }
 
     fn materialize_cell_root(&self, key: &SandboxCellKey) -> Result<PathBuf, SandboxError> {
         let session = key
             .session_id
             .map_or_else(|| "shared".to_string(), |value| value.to_string());
-        let root = self
-            .storage_root
-            .join("cells")
-            .join(key.kind.as_str())
-            .join(sanitize_segment(&key.agent_id))
-            .join(session)
-            .join(sanitize_segment(&key.component_id));
-        std::fs::create_dir_all(&root).map_err(SandboxError::Io)?;
+        let cells_root = ensure_child_directory(&self.storage_root, "cells")?;
+        let kind_root = ensure_child_directory(&cells_root, key.kind.as_str())?;
+        let agent_root = ensure_child_directory(&kind_root, &sanitize_segment(&key.agent_id))?;
+        let session_root = ensure_child_directory(&agent_root, &session)?;
+        ensure_child_directory(&session_root, &sanitize_segment(&key.component_id))
+    }
+
+    fn ensure_managed_cell_dirs(&self, root: &Path) -> Result<PathBuf, SandboxError> {
+        std::fs::create_dir_all(root).map_err(SandboxError::Io)?;
+        let root = canonicalize_existing_path(root)?;
+        ManagedCellLayout::new(root.clone()).ensure()?;
         Ok(root)
     }
 
-    fn ensure_managed_cell_dirs(&self, root: &Path) -> Result<(), SandboxError> {
-        for dir in [
-            root.join("app"),
-            root.join("data"),
-            root.join("cache"),
-            root.join("runs"),
-            root.join("logs"),
-        ] {
-            std::fs::create_dir_all(dir).map_err(SandboxError::Io)?;
+    fn find_matching_cell(
+        &self,
+        key: &SandboxCellKey,
+        workspace_root: &Path,
+        cell_root: &Path,
+        mode: SandboxMode,
+        policy: &SandboxPolicy,
+    ) -> Result<Option<Arc<SandboxCellState>>, SandboxError> {
+        let cells = self.cells.lock();
+        let Some(state) = cells.get(key) else {
+            return Ok(None);
+        };
+
+        self.validate_matching_cell(state, workspace_root, cell_root, mode, policy)?;
+        Ok(Some(state.clone()))
+    }
+
+    fn validate_matching_cell(
+        &self,
+        state: &SandboxCellState,
+        workspace_root: &Path,
+        cell_root: &Path,
+        mode: SandboxMode,
+        policy: &SandboxPolicy,
+    ) -> Result<(), SandboxError> {
+        if state.workspace_root == workspace_root
+            && state.cell_root == cell_root
+            && state.mode == mode
+            && state.policy == *policy
+        {
+            return Ok(());
         }
+
+        Err(SandboxError::InvalidConfig(format!(
+            "sandbox cell '{}' already exists with a different root, mode, or policy",
+            state.key.component_id
+        )))
+    }
+
+    fn remove_session_roots(&self, session_id: Uuid) -> Result<(), SandboxError> {
+        let cells_root = self.storage_root.join("cells");
+        if !cells_root.exists() {
+            return Ok(());
+        }
+
+        let session_segment = session_id.to_string();
+        for kind_entry in std::fs::read_dir(&cells_root).map_err(SandboxError::Io)? {
+            let kind_entry = kind_entry.map_err(SandboxError::Io)?;
+            let kind_path = kind_entry.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+
+            for agent_entry in std::fs::read_dir(&kind_path).map_err(SandboxError::Io)? {
+                let agent_entry = agent_entry.map_err(SandboxError::Io)?;
+                let agent_path = agent_entry.path();
+                if !agent_path.is_dir() {
+                    continue;
+                }
+
+                remove_directory_tree_if_safe(&agent_path.join(&session_segment))?;
+            }
+        }
+
         Ok(())
     }
+}
+
+fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, SandboxError> {
+    let child = parent.join(name);
+    match std::fs::symlink_metadata(&child) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(SandboxError::InvalidConfig(format!(
+                    "sandbox path must not be a symlink: {}",
+                    child.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(SandboxError::InvalidConfig(format!(
+                    "sandbox path must be a directory: {}",
+                    child.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&child).map_err(SandboxError::Io)?;
+        }
+        Err(err) => return Err(SandboxError::Io(err)),
+    }
+
+    canonicalize_existing_path(&child)
+}
+
+fn remove_directory_tree_if_safe(path: &Path) -> Result<(), SandboxError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(SandboxError::InvalidConfig(format!(
+                    "sandbox path must not be a symlink: {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(SandboxError::InvalidConfig(format!(
+                    "sandbox path must be a directory: {}",
+                    path.display()
+                )));
+            }
+            std::fs::remove_dir_all(path).map_err(SandboxError::Io)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SandboxError::Io(err)),
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: &Path) {
+    let value = path.display().to_string();
+    if !paths.iter().any(|existing| existing == &value) {
+        paths.push(value);
+        paths.sort();
+        paths.dedup();
+    }
+}
+
+fn augment_managed_cell_policy(
+    mode: SandboxMode,
+    mut policy: SandboxPolicy,
+    layout: &ManagedCellLayout,
+) -> SandboxPolicy {
+    push_unique_path(&mut policy.filesystem.read_roots, layout.root());
+
+    match mode {
+        SandboxMode::DangerFullAccess | SandboxMode::WorkspaceWrite => {
+            push_unique_path(&mut policy.filesystem.write_roots, layout.root());
+        }
+        SandboxMode::ReadOnly => {
+            for path in [
+                layout.data_dir(),
+                layout.cache_dir(),
+                layout.tmp_dir(),
+                layout.runs_dir(),
+            ] {
+                push_unique_path(&mut policy.filesystem.write_roots, &path);
+            }
+        }
+    }
+
+    policy
+        .env
+        .set
+        .entry("HOME".to_string())
+        .or_insert_with(|| layout.home_dir().display().to_string());
+    policy
+        .env
+        .set
+        .entry("TMPDIR".to_string())
+        .or_insert_with(|| layout.tmp_dir().display().to_string());
+    policy
+        .env
+        .set
+        .entry("XDG_DATA_HOME".to_string())
+        .or_insert_with(|| layout.data_dir().display().to_string());
+    policy
+        .env
+        .set
+        .entry("XDG_CACHE_HOME".to_string())
+        .or_insert_with(|| layout.cache_dir().display().to_string());
+
+    policy
 }
 
 fn sanitize_segment(value: &str) -> String {
@@ -368,21 +596,47 @@ fn sanitize_segment(value: &str) -> String {
         }
     }
     if sanitized.is_empty() {
-        "default".to_string()
-    } else {
-        sanitized
+        sanitized = "default".to_string();
     }
+    if sanitized.len() > 32 {
+        sanitized.truncate(32);
+        while sanitized.ends_with('_') {
+            sanitized.pop();
+        }
+        if sanitized.is_empty() {
+            sanitized = "default".to_string();
+        }
+    }
+
+    let digest = Sha256::digest(value.as_bytes());
+    let suffix = hex::encode(&digest[..6]);
+    format!("{sanitized}-{suffix}")
+}
+
+#[cfg(test)]
+fn has_same_sanitized_prefix(left: &str, right: &str) -> bool {
+    fn prefix(value: &str) -> &str {
+        value.rsplit_once('-').map_or(value, |(prefix, _)| prefix)
+    }
+
+    prefix(left) == prefix(right)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SandboxCellKey, SandboxCellKind, SandboxCellRoot, SandboxCellSpec, SandboxRuntime,
-        sanitize_segment,
+        SandboxCellKey, SandboxCellKind, SandboxCellSpec, SandboxRuntime,
+        augment_managed_cell_policy, has_same_sanitized_prefix, sanitize_segment,
     };
-    use crate::{LocalSandboxProvider, SandboxPolicy};
+    use crate::{
+        AccessDecision, AccessMode, CommandResult, CommandSpec, LocalSandboxProvider,
+        SandboxContext, SandboxError, SandboxHandle, SandboxPolicy, SandboxProvider,
+    };
+    use async_trait::async_trait;
     use odyssey_rs_protocol::SandboxMode;
+    use parking_lot::Mutex as ParkingMutex;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -396,31 +650,43 @@ mod tests {
             temp.path().join("sandbox"),
         )
         .expect("runtime");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let root = runtime.managed_cell_root(&key).expect("managed root");
 
         let first = runtime
-            .lease_cell(SandboxCellSpec::tooling(
-                Uuid::nil(),
-                "agent",
-                workspace.clone(),
-                SandboxMode::WorkspaceWrite,
+            .lease_cell(SandboxCellSpec::managed_component(
+                key.clone(),
+                root.clone(),
+                SandboxMode::DangerFullAccess,
                 SandboxPolicy::default(),
             ))
             .await
             .expect("first lease");
         let second = runtime
-            .lease_cell(SandboxCellSpec::tooling(
-                Uuid::nil(),
-                "agent",
-                workspace,
-                SandboxMode::WorkspaceWrite,
+            .lease_cell(SandboxCellSpec::managed_component(
+                key,
+                root,
+                SandboxMode::DangerFullAccess,
                 SandboxPolicy::default(),
             ))
             .await
             .expect("second lease");
 
         assert_eq!(first.handle().id, second.handle().id);
+    }
+
+    #[test]
+    fn sanitize_segment_keeps_colliding_prefixes_distinct() {
+        let first = sanitize_segment("agent/name");
+        let second = sanitize_segment("agent?name");
+
+        assert!(has_same_sanitized_prefix(&first, &second));
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
@@ -432,29 +698,92 @@ mod tests {
             temp.path().join("sandbox"),
         )
         .expect("runtime");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let root = runtime.managed_cell_root(&key).expect("managed root");
 
         let lease = runtime
             .lease_cell(SandboxCellSpec {
-                key: SandboxCellKey {
-                    session_id: Some(Uuid::nil()),
-                    agent_id: "agent".to_string(),
-                    kind: SandboxCellKind::Skill,
-                    component_id: "writer".to_string(),
-                },
-                root: SandboxCellRoot::ManagedPrivate,
-                mode: SandboxMode::WorkspaceWrite,
+                key,
+                cell_root: root,
+                mode: SandboxMode::DangerFullAccess,
                 policy: SandboxPolicy::default(),
             })
             .await
             .expect("lease");
 
-        assert!(lease.cell_root().ends_with("writer"));
+        let component_name = lease
+            .cell_root()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("component name");
+        assert!(component_name.starts_with("writer-"));
+        assert_eq!(lease.workspace_root(), lease.app_dir());
         assert!(lease.data_dir().exists());
+        assert!(lease.cache_dir().exists());
+        assert!(lease.cell_root().join("tmp").exists());
         let execution = lease.begin_execution().expect("execution dirs");
+        assert!(execution.root.exists());
         assert!(execution.inbox.exists());
         assert!(execution.outbox.exists());
         assert!(execution.work.exists());
         assert!(execution.tmp.exists());
+    }
+
+    #[tokio::test]
+    async fn managed_cells_use_private_runtime_environment_defaults() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = SandboxRuntime::new(
+            "host",
+            Arc::new(LocalSandboxProvider::default()),
+            temp.path().join("sandbox"),
+        )
+        .expect("runtime");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let root = runtime.managed_cell_root(&key).expect("managed root");
+
+        let lease = runtime
+            .lease_cell(SandboxCellSpec::managed_component(
+                key,
+                root.clone(),
+                SandboxMode::DangerFullAccess,
+                SandboxPolicy::default(),
+            ))
+            .await
+            .expect("lease");
+
+        let mut spec = CommandSpec::new("sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "printf '%s\\n%s\\n%s\\n%s' \"$HOME\" \"$TMPDIR\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\""
+                .to_string(),
+        ];
+
+        let result = lease
+            .provider()
+            .run_command(&lease.handle(), spec)
+            .await
+            .expect("run");
+
+        assert_eq!(
+            result.stdout,
+            format!(
+                "{}\n{}\n{}\n{}",
+                lease.data_dir().join("home").display(),
+                lease.cell_root().join("tmp").display(),
+                lease.cache_dir().display(),
+                lease.data_dir().display()
+            )
+        );
     }
 
     #[tokio::test]
@@ -466,28 +795,31 @@ mod tests {
             temp.path().join("sandbox"),
         )
         .expect("runtime");
-        let workspace = temp.path().join("workspace");
         let alternate = temp.path().join("alternate");
-        std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&alternate).expect("alternate");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let root = runtime.managed_cell_root(&key).expect("managed root");
 
         runtime
-            .lease_cell(SandboxCellSpec::tooling(
-                Uuid::nil(),
-                "agent",
-                workspace,
-                SandboxMode::WorkspaceWrite,
+            .lease_cell(SandboxCellSpec::managed_component(
+                key.clone(),
+                root,
+                SandboxMode::DangerFullAccess,
                 SandboxPolicy::default(),
             ))
             .await
             .expect("first lease");
 
         let error = match runtime
-            .lease_cell(SandboxCellSpec::tooling(
-                Uuid::nil(),
-                "agent",
+            .lease_cell(SandboxCellSpec::managed_component(
+                key,
                 alternate,
-                SandboxMode::WorkspaceWrite,
+                SandboxMode::DangerFullAccess,
                 SandboxPolicy::default(),
             ))
             .await
@@ -505,9 +837,9 @@ mod tests {
 
     #[test]
     fn sanitize_segment_rewrites_unsafe_characters() {
-        assert_eq!(sanitize_segment("agent/name"), "agent_name");
-        assert_eq!(sanitize_segment(""), "default");
-        assert_eq!(sanitize_segment("safe-_value"), "safe-_value");
+        assert!(sanitize_segment("agent/name").starts_with("agent_name-"));
+        assert!(sanitize_segment("").starts_with("default-"));
+        assert!(sanitize_segment("safe-_value").starts_with("safe-_value-"));
     }
 
     #[test]
@@ -552,17 +884,250 @@ mod tests {
         let key = SandboxCellKey {
             session_id: None,
             agent_id: "agent/name".to_string(),
-            kind: SandboxCellKind::Mcp,
+            kind: SandboxCellKind::Tooling,
             component_id: "comp:id".to_string(),
         };
 
         let root = runtime.managed_cell_root(&key).expect("managed root");
 
-        assert!(root.ends_with("comp_id"));
+        let component_name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("component name");
+        assert!(component_name.starts_with("comp_id-"));
         assert!(root.join("app").exists());
         assert!(root.join("data").exists());
+        assert!(root.join("data").join("home").exists());
         assert!(root.join("cache").exists());
+        assert!(root.join("tmp").exists());
         assert!(root.join("runs").exists());
-        assert!(root.join("logs").exists());
+    }
+
+    #[test]
+    fn managed_read_only_policy_keeps_app_read_only_but_exposes_private_state_dirs() {
+        let temp = tempdir().expect("tempdir");
+        let layout_root = temp.path().join("cell");
+        std::fs::create_dir_all(&layout_root).expect("layout root");
+        let policy = augment_managed_cell_policy(
+            SandboxMode::ReadOnly,
+            SandboxPolicy::default(),
+            &super::ManagedCellLayout::new(layout_root.clone()),
+        );
+
+        assert!(
+            policy
+                .filesystem
+                .read_roots
+                .contains(&layout_root.display().to_string())
+        );
+        assert!(
+            !policy
+                .filesystem
+                .write_roots
+                .contains(&layout_root.display().to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .write_roots
+                .contains(&layout_root.join("data").display().to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .write_roots
+                .contains(&layout_root.join("cache").display().to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .write_roots
+                .contains(&layout_root.join("tmp").display().to_string())
+        );
+        assert_eq!(
+            policy.env.set.get("HOME"),
+            Some(&layout_root.join("data").join("home").display().to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_cell_root_rejects_symlinked_storage_components() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let runtime = SandboxRuntime::new(
+            "host",
+            Arc::new(LocalSandboxProvider::default()),
+            temp.path().join("sandbox"),
+        )
+        .expect("runtime");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let agent_segment = sanitize_segment(&key.agent_id);
+        let kind_root = runtime.storage_root().join("cells").join("tooling");
+        let session_parent = kind_root.join(agent_segment);
+        std::fs::create_dir_all(&session_parent).expect("session parent");
+        symlink(
+            temp.path().join("outside"),
+            session_parent.join(Uuid::nil().to_string()),
+        )
+        .expect("session symlink");
+
+        let error = runtime
+            .managed_cell_root(&key)
+            .expect_err("symlinked component rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox path must not be a symlink")
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        contexts: ParkingMutex<Vec<SandboxContext>>,
+        shutdowns: ParkingMutex<Vec<Uuid>>,
+    }
+
+    #[async_trait]
+    impl SandboxProvider for RecordingProvider {
+        async fn prepare(&self, ctx: &SandboxContext) -> Result<SandboxHandle, SandboxError> {
+            self.contexts.lock().push(ctx.clone());
+            Ok(SandboxHandle { id: Uuid::new_v4() })
+        }
+
+        async fn run_command(
+            &self,
+            _handle: &SandboxHandle,
+            _spec: CommandSpec,
+        ) -> Result<CommandResult, SandboxError> {
+            Err(SandboxError::Unsupported("not used in test".to_string()))
+        }
+
+        async fn run_command_streaming(
+            &self,
+            _handle: &SandboxHandle,
+            _spec: CommandSpec,
+            _sink: &mut dyn crate::CommandOutputSink,
+        ) -> Result<CommandResult, SandboxError> {
+            Err(SandboxError::Unsupported("not used in test".to_string()))
+        }
+
+        fn check_access(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &Path,
+            _mode: AccessMode,
+        ) -> AccessDecision {
+            AccessDecision::Allow
+        }
+
+        fn shutdown(&self, handle: SandboxHandle) {
+            self.shutdowns.lock().push(handle.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_passes_augmented_policy_to_managed_read_only_cells() {
+        let temp = tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingProvider::default());
+        let runtime =
+            SandboxRuntime::new("recording", provider.clone(), temp.path().join("sandbox"))
+                .expect("runtime");
+        let key = SandboxCellKey {
+            session_id: Some(Uuid::nil()),
+            agent_id: "agent".to_string(),
+            kind: SandboxCellKind::Tooling,
+            component_id: "writer".to_string(),
+        };
+        let root = runtime.managed_cell_root(&key).expect("managed root");
+
+        let _ = runtime
+            .lease_cell(SandboxCellSpec::managed_component(
+                key,
+                root.clone(),
+                SandboxMode::ReadOnly,
+                SandboxPolicy::default(),
+            ))
+            .await
+            .expect("lease");
+
+        let contexts = provider.contexts.lock();
+        let context = contexts.first().expect("recorded context");
+        assert_eq!(context.workspace_root, root.join("app"));
+        assert!(
+            context
+                .policy
+                .filesystem
+                .read_roots
+                .contains(&root.display().to_string())
+        );
+        assert!(
+            !context
+                .policy
+                .filesystem
+                .write_roots
+                .contains(&root.display().to_string())
+        );
+        assert!(
+            context
+                .policy
+                .filesystem
+                .write_roots
+                .contains(&root.join("tmp").display().to_string())
+        );
+        assert_eq!(
+            context.policy.env.set.get("TMPDIR"),
+            Some(&root.join("tmp").display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_session_removes_active_cells_and_storage_roots() {
+        let temp = tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingProvider::default());
+        let runtime =
+            SandboxRuntime::new("recording", provider.clone(), temp.path().join("sandbox"))
+                .expect("runtime");
+        let session_id = Uuid::new_v4();
+        let primary = SandboxCellKey::tooling(session_id, "agent");
+        let secondary = SandboxCellKey::tooling_component(session_id, "agent", "session-command");
+        let primary_root = runtime.managed_cell_root(&primary).expect("primary root");
+        let secondary_root = runtime
+            .managed_cell_root(&secondary)
+            .expect("secondary root");
+
+        let _primary = runtime
+            .lease_cell(SandboxCellSpec::managed_component(
+                primary.clone(),
+                primary_root.clone(),
+                SandboxMode::ReadOnly,
+                SandboxPolicy::default(),
+            ))
+            .await
+            .expect("primary lease");
+        let _secondary = runtime
+            .lease_cell(SandboxCellSpec::managed_component(
+                secondary,
+                secondary_root.clone(),
+                SandboxMode::ReadOnly,
+                SandboxPolicy::default(),
+            ))
+            .await
+            .expect("secondary lease");
+
+        runtime
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+
+        assert_eq!(provider.shutdowns.lock().len(), 2);
+        assert!(!primary_root.exists());
+        assert!(!secondary_root.exists());
     }
 }

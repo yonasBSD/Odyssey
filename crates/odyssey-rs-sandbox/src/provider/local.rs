@@ -3,7 +3,7 @@ use crate::{
     SandboxError, SandboxHandle, SandboxProvider,
     provider::{
         BufferingSink, PreparedSandbox, build_host_child_command, build_prepared_sandbox,
-        run_host_process,
+        run_host_process, validate_host_execution_context,
     },
 };
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ pub type LocalSandboxProvider = HostExecProvider;
 #[async_trait]
 impl SandboxProvider for HostExecProvider {
     async fn prepare(&self, ctx: &SandboxContext) -> Result<SandboxHandle, SandboxError> {
+        validate_host_execution_context(ctx)?;
         let prepared = build_prepared_sandbox(ctx)?;
         let handle = SandboxHandle {
             id: uuid::Uuid::new_v4(),
@@ -90,7 +91,7 @@ impl SandboxProvider for HostExecProvider {
         build_host_child_command(spec, &prepared)
     }
 
-    async fn shutdown(&self, handle: SandboxHandle) {
+    fn shutdown(&self, handle: SandboxHandle) {
         info!("host execution provider shutdown (handle_id={})", handle.id);
         self.state.write().remove(&handle.id);
     }
@@ -111,7 +112,7 @@ mod tests {
         let provider = HostExecProvider::default();
         let ctx = SandboxContext {
             workspace_root: workspace.path().to_path_buf(),
-            mode: SandboxMode::WorkspaceWrite,
+            mode: SandboxMode::DangerFullAccess,
             policy: SandboxPolicy::default(),
         };
         let handle = provider.prepare(&ctx).await.expect("prepare");
@@ -131,7 +132,7 @@ mod tests {
         let provider = HostExecProvider::default();
         let ctx = SandboxContext {
             workspace_root: workspace.path().to_path_buf(),
-            mode: SandboxMode::WorkspaceWrite,
+            mode: SandboxMode::DangerFullAccess,
             policy: SandboxPolicy::default(),
         };
         let handle = provider.prepare(&ctx).await.expect("prepare");
@@ -144,15 +145,46 @@ mod tests {
         );
 
         let outside = tempdir().expect("outside");
-        match provider.check_access(&handle, outside.path(), AccessMode::Write) {
-            AccessDecision::Deny(message) => assert!(!message.is_empty()),
-            other => panic!("unexpected decision: {other:?}"),
-        }
+        assert_eq!(
+            provider.check_access(&handle, outside.path(), AccessMode::Write),
+            AccessDecision::Allow
+        );
 
-        provider.shutdown(handle).await;
+        let private_tmp_dir = provider
+            .state
+            .read()
+            .get(&handle.id)
+            .and_then(|prepared| {
+                prepared
+                    ._private_tmp_dir
+                    .as_ref()
+                    .map(|path| path.path().to_path_buf())
+            })
+            .expect("private tmp dir");
+        assert!(private_tmp_dir.exists());
+
+        provider.shutdown(handle);
+        assert!(!private_tmp_dir.exists());
         match provider.check_access(&handle_clone, &inside, AccessMode::Read) {
             AccessDecision::Deny(message) => assert!(message.contains("unknown")),
             other => panic!("unexpected decision: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn host_provider_rejects_restricted_modes() {
+        let workspace = tempdir().expect("workspace");
+        let provider = HostExecProvider::default();
+        let ctx = SandboxContext {
+            workspace_root: workspace.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+
+        let error = provider
+            .prepare(&ctx)
+            .await
+            .expect_err("restricted mode rejected");
+        assert!(error.to_string().contains("danger_full_access"));
     }
 }

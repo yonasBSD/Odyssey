@@ -12,7 +12,7 @@ use crate::{
     provider::{
         BufferingSink, DependencyReport, Mount, PreparedSandbox, bind_if_exists,
         build_prepared_sandbox, collect_child_result, command_display, configure_child_unix,
-        merge_command_env, resolve_command_path, resolve_working_dir, wrap_command_with_landlock,
+        merge_command_env, resolve_command_path, resolve_working_dir,
     },
     types::SandboxNetworkMode,
 };
@@ -67,8 +67,7 @@ impl BubblewrapProvider {
         let cwd = resolve_working_dir(spec, prepared)?;
         let command = resolve_command_path(&spec.command, &cwd, prepared)?;
         let env = merge_command_env(prepared, &spec.env)?;
-        let (command, args) =
-            wrap_command_with_landlock(command, spec.args.clone(), spec.landlock.as_ref())?;
+        let args = spec.args.clone();
 
         let mut bwrap_args: Vec<String> = vec![
             "--die-with-parent".to_string(),
@@ -90,7 +89,7 @@ impl BubblewrapProvider {
         }
 
         append_etc_mounts(&mut bwrap_args);
-        append_runtime_mounts(&mut bwrap_args);
+        append_runtime_support_mounts(&mut bwrap_args);
         let sandbox_tmp = sandbox_tmp_dir();
         bwrap_args.push("--dev".to_string());
         bwrap_args.push("/dev".to_string());
@@ -108,6 +107,7 @@ impl BubblewrapProvider {
         for mount in &prepared.mounts {
             append_mount(&mut bwrap_args, mount)?;
         }
+        append_command_mount_if_needed(&mut bwrap_args, prepared, &command)?;
 
         bwrap_args.push("--chdir".to_string());
         bwrap_args.push(cwd.display().to_string());
@@ -128,6 +128,43 @@ impl BubblewrapProvider {
         cmd.args(&bwrap_args);
         Ok(cmd)
     }
+}
+
+fn append_command_mount_if_needed(
+    args: &mut Vec<String>,
+    prepared: &PreparedSandbox,
+    command: &Path,
+) -> Result<(), SandboxError> {
+    if !command.is_absolute() || path_is_mounted(command, prepared) {
+        return Ok(());
+    }
+
+    let source = command.canonicalize().map_err(SandboxError::Io)?;
+    args.push("--ro-bind".to_string());
+    args.push(source.display().to_string());
+    args.push(command.display().to_string());
+    Ok(())
+}
+
+fn path_is_mounted(path: &Path, prepared: &PreparedSandbox) -> bool {
+    prepared
+        .mounts
+        .iter()
+        .any(|mount| path.starts_with(&mount.target))
+        || [
+            "/lib",
+            "/lib64",
+            "/lib32",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib32",
+            "/usr/libexec",
+            "/libexec",
+            "/etc",
+            "/dev",
+        ]
+        .into_iter()
+        .any(|root| path.starts_with(root))
 }
 
 #[async_trait]
@@ -221,7 +258,7 @@ impl SandboxProvider for BubblewrapProvider {
         Ok(command)
     }
 
-    async fn shutdown(&self, handle: SandboxHandle) {
+    fn shutdown(&self, handle: SandboxHandle) {
         info!("bubblewrap sandbox shutdown (handle_id={})", handle.id);
         self.state.write().remove(&handle.id);
     }
@@ -315,11 +352,28 @@ pub(crate) fn append_etc_mounts(args: &mut Vec<String>) {
     for (source, target) in file_mounts {
         bind_if_exists(args, "--ro-bind", Path::new(source), Path::new(target));
     }
+
+    // HTTPS clients need access to the host CA trust store inside the sandbox.
+    for dir in ["/etc/ssl", "/etc/pki", "/etc/ca-certificates"] {
+        bind_if_exists(args, "--ro-bind", Path::new(dir), Path::new(dir));
+    }
 }
 
-pub(crate) fn append_runtime_mounts(args: &mut Vec<String>) {
-    for dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/opt"] {
+pub(crate) fn append_runtime_support_mounts(args: &mut Vec<String>) {
+    for dir in [
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib32",
+        "/usr/lib32",
+        "/usr/libexec",
+        "/libexec",
+    ] {
         bind_if_exists(args, "--ro-bind", Path::new(dir), Path::new(dir));
+    }
+    for file in ["/etc/ld.so.cache", "/etc/ld.so.conf"] {
+        bind_if_exists(args, "--ro-bind", Path::new(file), Path::new(file));
     }
     // Keep /run private so the sandbox cannot reach host Unix-domain sockets.
     args.push("--tmpfs".to_string());
@@ -328,9 +382,10 @@ pub(crate) fn append_runtime_mounts(args: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_mount, append_runtime_mounts};
+    use super::{append_etc_mounts, append_mount, append_runtime_support_mounts};
     use crate::provider::Mount;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -380,11 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn append_runtime_mounts_binds_existing_system_roots() {
+    fn append_runtime_support_mounts_only_binds_runtime_dependencies() {
         let mut args = Vec::new();
-        append_runtime_mounts(&mut args);
+        append_runtime_support_mounts(&mut args);
 
-        assert!(args.windows(3).any(|window| {
+        assert!(!args.windows(3).any(|window| {
             window[0] == "--ro-bind" && window[1] == "/usr" && window[2] == "/usr"
         }));
         assert!(
@@ -396,5 +451,20 @@ mod tests {
                 && window[1] == "/run"
                 && window[2] == "/run"
         }));
+    }
+
+    #[test]
+    fn append_etc_mounts_binds_common_certificate_roots_when_present() {
+        let mut args = Vec::new();
+        append_etc_mounts(&mut args);
+
+        for dir in ["/etc/ssl", "/etc/pki", "/etc/ca-certificates"] {
+            if !Path::new(dir).exists() {
+                continue;
+            }
+            assert!(args.windows(3).any(|window| {
+                window[0] == "--ro-bind" && window[1] == dir && window[2] == dir
+            }));
+        }
     }
 }

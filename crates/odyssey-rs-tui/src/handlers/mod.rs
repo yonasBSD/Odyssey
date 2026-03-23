@@ -106,25 +106,24 @@ mod tests {
         skill_description: &str,
     ) {
         fs::create_dir_all(root.join("skills").join(skill_name)).expect("create skill dir");
-        fs::create_dir_all(root.join("data")).expect("create data dir");
+        fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
         fs::write(
             root.join("odyssey.bundle.json5"),
             format!(
                 r#"{{
                     id: "{bundle_id}",
                     version: "0.1.0",
+                    manifest_version: "odyssey.bundle/v1",
+                    readme: "README.md",
                     agent_spec: "agent.yaml",
                     executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ provider: {{ type: "prebuilt", id: "sliding_window" }} }},
-                    resources: ["data"],
+                    memory: {{ type: "prebuilt", id: "sliding_window" }},
                     skills: [{{ name: "{skill_name}", path: "skills/{skill_name}" }}],
                     tools: [{{ name: "Read", source: "builtin" }}],
-                    server: {{ enable_http: true }},
                     sandbox: {{
                         permissions: {{
                             filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: [],
-                            tools: {{ mode: "default", rules: [] }}
+                            network: []
                         }},
                         system_tools: [],
                         resources: {{}}
@@ -144,17 +143,21 @@ model:
   name: {model_name}
 tools:
   allow: ["Read", "Skill"]
-  deny: []
 "#
             ),
         )
         .expect("write agent");
+        fs::write(root.join("README.md"), format!("# {bundle_id}\n")).expect("write readme");
         fs::write(
             root.join("skills").join(skill_name).join("SKILL.md"),
             format!("# {skill_name}\n\n{skill_description}\n"),
         )
         .expect("write skill");
-        fs::write(root.join("data").join("notes.txt"), "hello world\n").expect("write resource");
+        fs::write(
+            root.join("resources").join("data").join("notes.txt"),
+            "hello world\n",
+        )
+        .expect("write resource");
     }
 
     fn abort_stream(handle: &mut Option<JoinHandle<()>>) {
@@ -344,6 +347,16 @@ tools:
             .await
             .expect("send message without session");
         assert_eq!(no_session_app.status, "no active session");
+
+        let mut no_session_command_app = App {
+            input: "!pwd".to_string(),
+            ..App::default()
+        };
+        let (sender, _receiver) = mpsc::channel(16);
+        session::send_command(&client, &mut no_session_command_app, sender)
+            .await
+            .expect("send command without session");
+        assert_eq!(no_session_command_app.status, "no active session");
         abort_stream(&mut stream_handle);
     }
 
@@ -459,6 +472,27 @@ tools:
         .await
         .expect("handle chat scroll");
         assert_eq!(app.scroll, 10);
+
+        app.status = "running".to_string();
+        handle_app_event(
+            AppEvent::Server(EventMsg {
+                id: Uuid::new_v4(),
+                session_id: active_session,
+                created_at: Utc::now(),
+                payload: EventPayload::ExecCommandEnd {
+                    turn_id: Uuid::new_v4(),
+                    exec_id: Uuid::new_v4(),
+                    exit_code: 0,
+                },
+            }),
+            &client,
+            &mut app,
+            sender.clone(),
+            &mut stream_handle,
+        )
+        .await
+        .expect("handle exec end");
+        assert_eq!(app.status, "idle");
 
         handle_app_event(
             AppEvent::Tick,

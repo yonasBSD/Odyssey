@@ -1,23 +1,26 @@
 use chrono::Utc;
-use odyssey_rs_protocol::{AgentRef, EventMsg, ExecutionRequest, ModelSpec, Task, TurnContext};
+use log::{debug, info};
+use odyssey_rs_protocol::{BundleRef, EventMsg, ExecutionRequest, ModelSpec, Task, TurnContext};
 use odyssey_rs_sandbox::SandboxMode;
 use odyssey_rs_tools::{ToolContext, tools_to_adaptors};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::{sync::broadcast, time::Instant};
 use uuid::Uuid;
 
 use crate::{
     RunOutput, RuntimeError,
     agent::{ExecutorRun, run_executor},
     memory::build_memory,
-    resolver::{agent::ResolvedAgentSpec, agent::resolve_agent, llm::LLMResolver},
+    resolver::{bundle::ResolvedBundle, bundle::resolve_bundle_from_ref, llm::LLMResolver},
     runtime::{
         engine::OdysseyRuntimeInner,
         history::TurnHistoryCollector,
         prompt::build_system_prompt,
         tool_event::{RuntimeApprovalHandler, RuntimeToolEventSink},
     },
-    sandbox::{build_permission_rules, build_sandbox_runtime, prepare_cell},
+    sandbox::{
+        PreparedToolSandbox, build_permission_rules, prepare_cell, prepare_operator_command_cell,
+    },
     session::{SessionRecord, TurnChatMessageRecord, TurnRecord},
     skill::BundleSkillStore,
     tool::select_tools,
@@ -36,15 +39,21 @@ impl ScheduleExecutor {
         turn_id: Uuid,
         request: ExecutionRequest,
     ) -> Result<RunOutput, RuntimeError> {
+        info!("Received execution request : {}", request.request_id);
+        let _session_guard = self
+            .runtime
+            .lock_session_execution(request.session_id)
+            .await;
         let session = self.runtime.sessions.get(request.session_id)?;
-        let resolved = resolve_agent(
+        let resolved = resolve_bundle_from_ref(
             &self.runtime.store,
-            &AgentRef::from(session.agent_ref.clone()),
+            &BundleRef::from(session.bundle_ref.clone()),
         )?;
         let sender = self.runtime.sessions.sender(request.session_id)?;
         let receiver = self.runtime.sessions.subscribe(request.session_id)?;
+        let start_time = Instant::now();
         let response = self
-            .execute_resolved_agent(
+            .execute_resolved_bundle(
                 resolved,
                 session.clone(),
                 turn_id,
@@ -53,6 +62,11 @@ impl ScheduleExecutor {
                 sender.clone(),
             )
             .await?;
+        info!(
+            "Execution : {}, completed with time: {}",
+            request.request_id,
+            start_time.elapsed().as_millis()
+        );
         let chat_history = collect_turn_chat_history(turn_id, &request.input, &response, receiver);
         self.runtime.sessions.append_turn(
             request.session_id,
@@ -71,9 +85,9 @@ impl ScheduleExecutor {
         })
     }
 
-    async fn execute_resolved_agent(
+    async fn execute_resolved_bundle(
         &self,
-        resolved: ResolvedAgentSpec,
+        resolved: ResolvedBundle,
         session: SessionRecord,
         turn_id: Uuid,
         task: Task,
@@ -81,29 +95,17 @@ impl ScheduleExecutor {
         sender: broadcast::Sender<EventMsg>,
     ) -> Result<String, RuntimeError> {
         let session_id = session.id;
-        let mode_override = self
-            .runtime
-            .config
-            .sandbox_mode_override
-            .or(turn_context_override
-                .as_ref()
-                .and_then(|ctx| ctx.sandbox_mode));
+        let mode_override = self.runtime.config.sandbox_mode_override;
+
         let mode = effective_sandbox_mode(&resolved.manifest, mode_override);
-        let sandbox_runtime = if mode == SandboxMode::DangerFullAccess {
-            &self.runtime.host_sandbox
-        } else {
-            &Arc::new(build_sandbox_runtime(&self.runtime.config, mode)?)
-        };
-        let cell = prepare_cell(
-            sandbox_runtime,
-            session_id,
-            &resolved.agent.id,
-            &resolved.install_path,
-            &resolved.manifest,
-            mode_override,
-        )
-        .await?;
-        let permissions = build_permission_rules(&resolved.manifest);
+        debug!("Effective Sandbox mode: {:?}", mode);
+
+        //Prepare sandbox cell
+        let permissions = build_permission_rules(&resolved.default_agent)?;
+        let cell =
+            prepare_resolved_bundle_cell(&mode, &self.runtime, &resolved, session_id).await?;
+        info!("Prepared bundle cell");
+        info!("Built permission rules");
         let event_sink = Arc::new(RuntimeToolEventSink {
             session_id,
             turn_id,
@@ -118,34 +120,45 @@ impl ScheduleExecutor {
         });
         let skills = Arc::new(BundleSkillStore::load(&cell.root)?);
         let system_prompt = build_system_prompt(
-            &resolved.agent.prompt,
+            &resolved.default_agent.prompt,
             &skills,
             !resolved.manifest.skills.is_empty(),
         );
+        info!("Prepared System Prompt");
         let ctx = ToolContext {
             session_id,
             turn_id,
             bundle_root: cell.root.clone(),
             working_dir: cell.work_dir.clone(),
+            workspace_mounts: cell.workspace_mounts.clone(),
             sandbox: cell.sandbox,
             permission_rules: permissions,
             event_sink: Some(event_sink),
             approval_handler: Some(approval_handler),
             skills: Some(skills),
         };
-        let selected = select_tools(&self.runtime.tools, &resolved.manifest, &resolved.agent);
+        let selected = select_tools(
+            &self.runtime.tools,
+            &resolved.manifest,
+            &resolved.default_agent,
+        );
+        info!("Prepared Tool Context");
         let adapted = tools_to_adaptors(selected, ctx.clone());
         let model = resolve_model_spec(&session, &resolved, turn_context_override.as_ref());
         let llm_resolver = LLMResolver::new(&model);
         let llm = llm_resolver.build_llm()?;
+        info!("Built LLM using resolver");
         let memory = build_memory(&resolved.manifest, &session.turns)?;
+        info!("Built Memory");
         let turn_context = build_turn_context(
             cell.work_dir.display().to_string(),
             model.clone(),
             mode,
             turn_context_override.as_ref(),
         );
-        run_executor(ExecutorRun {
+        info!("Starting executor");
+        let start_time = Instant::now();
+        let result = run_executor(ExecutorRun {
             executor_id: resolved.manifest.executor.id.clone(),
             llm,
             system_prompt,
@@ -157,7 +170,12 @@ impl ScheduleExecutor {
             sender,
             turn_context,
         })
-        .await
+        .await;
+        info!(
+            "Completed executor - Time taken: {}",
+            start_time.elapsed().as_millis()
+        );
+        result
     }
 }
 
@@ -174,7 +192,53 @@ fn collect_turn_chat_history(
     collector.finish(response)
 }
 
-fn effective_sandbox_mode(
+pub(crate) async fn prepare_resolved_bundle_cell(
+    mode: &SandboxMode,
+    runtime: &Arc<OdysseyRuntimeInner>,
+    resolved: &ResolvedBundle,
+    session_id: Uuid,
+) -> Result<PreparedToolSandbox, RuntimeError> {
+    let sandbox_runtime = if mode == &SandboxMode::DangerFullAccess {
+        runtime.host_sandbox.clone()
+    } else {
+        runtime.restricted_sandbox.clone()
+    };
+
+    prepare_cell(
+        &sandbox_runtime,
+        session_id,
+        &resolved.default_agent.id,
+        &resolved.install_path,
+        &resolved.manifest,
+        runtime.config.sandbox_mode_override,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_resolved_bundle_command_cell(
+    mode: &SandboxMode,
+    runtime: &Arc<OdysseyRuntimeInner>,
+    resolved: &ResolvedBundle,
+    session_id: Uuid,
+) -> Result<PreparedToolSandbox, RuntimeError> {
+    let sandbox_runtime = if mode == &SandboxMode::DangerFullAccess {
+        runtime.host_sandbox.clone()
+    } else {
+        runtime.restricted_sandbox.clone()
+    };
+
+    prepare_operator_command_cell(
+        &sandbox_runtime,
+        session_id,
+        &resolved.default_agent.id,
+        &resolved.install_path,
+        &resolved.manifest,
+        runtime.config.sandbox_mode_override,
+    )
+    .await
+}
+
+pub(crate) fn effective_sandbox_mode(
     manifest: &odyssey_rs_manifest::BundleManifest,
     override_mode: Option<SandboxMode>,
 ) -> SandboxMode {
@@ -202,14 +266,14 @@ fn build_turn_context(
 
 fn resolve_model_spec(
     session: &SessionRecord,
-    resolved: &ResolvedAgentSpec,
+    resolved: &ResolvedBundle,
     override_ctx: Option<&odyssey_rs_protocol::TurnContextOverride>,
 ) -> ModelSpec {
     if let Some(model) = override_ctx.and_then(|ctx| ctx.model.clone()) {
         return model;
     }
 
-    let default_model = &resolved.default_model;
+    let default_model = &resolved.model;
     let config = if session.model_provider == default_model.provider
         && session.model_id == default_model.name
     {
@@ -232,7 +296,8 @@ fn resolve_model_spec(
 mod tests {
     use chrono::Utc;
     use odyssey_rs_manifest::{
-        BundleExecutor, BundleManifest, BundleMemory, BundleSandbox, BundleServer, BundleTool,
+        BundleExecutor, BundleManifest, BundleMemory, BundleSandbox, BundleTool, ManifestVersion,
+        ProviderKind,
     };
     use odyssey_rs_protocol::{EventMsg, EventPayload};
     use odyssey_rs_protocol::{ModelSpec, Task, TurnContextOverride};
@@ -242,7 +307,7 @@ mod tests {
     use tokio::sync::broadcast;
     use uuid::Uuid;
 
-    use crate::resolver::agent::ResolvedAgentSpec;
+    use crate::resolver::bundle::ResolvedBundle;
     use crate::runtime::executor::{
         build_turn_context, collect_turn_chat_history, effective_sandbox_mode, resolve_model_spec,
     };
@@ -252,20 +317,20 @@ mod tests {
         BundleManifest {
             id: "demo".to_string(),
             version: "0.1.0".to_string(),
+            manifest_version: ManifestVersion::V1,
+            readme: "README.md".to_string(),
             agent_spec: "agent.yaml".to_string(),
             executor: BundleExecutor {
-                kind: "prebuilt".to_string(),
+                kind: ProviderKind::Prebuilt,
                 id: "react".to_string(),
                 config: json!({}),
             },
             memory: BundleMemory::default(),
-            resources: Vec::new(),
             skills: Vec::new(),
             tools: vec![BundleTool {
                 name: "Read".to_string(),
                 source: "builtin".to_string(),
             }],
-            server: BundleServer::default(),
             sandbox: BundleSandbox {
                 mode,
                 ..BundleSandbox::default()
@@ -352,25 +417,25 @@ mod tests {
             },
             SandboxMode::WorkspaceWrite,
             Some(&TurnContextOverride {
-                metadata: json!({ "trace": "abc" }),
+                model: Some(ModelSpec {
+                    provider: "openai".to_string(),
+                    name: "gpt-4o".to_string(),
+                    config: None,
+                }),
                 ..TurnContextOverride::default()
             }),
         );
 
         assert_eq!(context.cwd.as_deref(), Some("/workspace/demo"));
-        assert_eq!(
-            context.metadata,
-            json!({
-                "trace": "abc"
-            })
-        );
+        assert_eq!(context.model.unwrap().name, "gpt-4o");
+        assert_eq!(context.metadata, json!({}));
     }
 
     #[test]
     fn resolve_model_spec_falls_back_to_bundle_default_config() {
         let session = SessionRecord {
             id: Uuid::new_v4(),
-            agent_ref: "demo@latest".to_string(),
+            bundle_ref: "demo@latest".to_string(),
             agent_id: "demo".to_string(),
             model_provider: "openai".to_string(),
             model_id: "gpt-5".to_string(),
@@ -378,10 +443,10 @@ mod tests {
             created_at: Utc::now(),
             turns: Vec::new(),
         };
-        let resolved = ResolvedAgentSpec {
+        let resolved = ResolvedBundle {
             install_path: std::path::PathBuf::from("/workspace/demo"),
             manifest: manifest(SandboxMode::WorkspaceWrite),
-            agent: odyssey_rs_manifest::AgentSpec {
+            default_agent: odyssey_rs_manifest::AgentSpec {
                 id: "demo".to_string(),
                 description: String::default(),
                 prompt: "You are demo".to_string(),
@@ -392,7 +457,7 @@ mod tests {
                 },
                 tools: odyssey_rs_manifest::AgentToolPolicy::default(),
             },
-            default_model: ModelSpec {
+            model: ModelSpec {
                 provider: "openai".to_string(),
                 name: "gpt-5".to_string(),
                 config: Some(json!({ "reasoning_effort": "medium" })),
@@ -408,7 +473,7 @@ mod tests {
     fn resolve_model_spec_prefers_turn_override() {
         let session = SessionRecord {
             id: Uuid::new_v4(),
-            agent_ref: "demo@latest".to_string(),
+            bundle_ref: "demo@latest".to_string(),
             agent_id: "demo".to_string(),
             model_provider: "openai".to_string(),
             model_id: "gpt-5".to_string(),
@@ -416,10 +481,10 @@ mod tests {
             created_at: Utc::now(),
             turns: Vec::new(),
         };
-        let resolved = ResolvedAgentSpec {
+        let resolved = ResolvedBundle {
             install_path: std::path::PathBuf::from("/workspace/demo"),
             manifest: manifest(SandboxMode::WorkspaceWrite),
-            agent: odyssey_rs_manifest::AgentSpec {
+            default_agent: odyssey_rs_manifest::AgentSpec {
                 id: "demo".to_string(),
                 description: String::default(),
                 prompt: "You are demo".to_string(),
@@ -430,7 +495,7 @@ mod tests {
                 },
                 tools: odyssey_rs_manifest::AgentToolPolicy::default(),
             },
-            default_model: ModelSpec {
+            model: ModelSpec {
                 provider: "openai".to_string(),
                 name: "gpt-5".to_string(),
                 config: Some(json!({ "reasoning_effort": "medium" })),

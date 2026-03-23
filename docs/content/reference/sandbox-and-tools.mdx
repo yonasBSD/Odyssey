@@ -6,15 +6,28 @@ description: Builtin tools, sandbox modes, and approval behavior in Odyssey.
 
 ## Builtin Tools
 
-The builtin tool registry currently contains:
+The builtin registry currently exposes these tools:
 
 - `Read`
 - `Write`
 - `Edit`
+- `LS`
 - `Glob`
 - `Grep`
 - `Bash`
 - `Skill`
+
+Useful distinctions:
+
+- `Read`, `LS`, `Glob`, and `Grep` respect `.gitignore` while traversing the visible workspace
+  and mounted host directories
+- `Write` and `Edit` mutate files through the tool API after sandbox write checks
+- `Bash` runs `sh -lc ...` inside the sandbox, so shell features like redirection, pipes, and
+  globbing work
+- `Skill` exposes bundle skill summaries through the runtime skill store
+
+That last point matters because process execution is governed by both filesystem access and
+executable policy, while direct file-writing tools are governed only by filesystem policy.
 
 ## How Tool Selection Works
 
@@ -24,9 +37,17 @@ Tool availability is the result of two filters:
    if `manifest.tools` is empty, the runtime starts from the full builtin registry; otherwise it
    starts from the named manifest tool list.
 2. Agent spec filter:
-   `tools.allow` narrows that list unless it contains `*`, and `tools.deny` removes entries.
+   `tools.allow` and `tools.ask` make tools available to the agent unless `tools.allow` contains `*`,
+   and exact entries in `tools.deny` remove tools from the final list.
 
 The final list is sorted, deduplicated, and adapted into the executor's tool interface.
+
+Important behavior detail:
+
+- if `manifest.tools` is empty, Odyssey starts from the full builtin registry
+- if `agent.tools.allow`, `ask`, and `deny` are all empty, the manifest selection remains in place
+- granular denies such as `Bash(curl:*)` do not remove the `Bash` tool from availability; they
+  only affect permission checks during execution
 
 ## Sandbox Modes
 
@@ -40,7 +61,7 @@ How they are used today:
 
 - `danger_full_access` uses the host provider directly
 - on Linux, `read_only` and `workspace_write` use the `bubblewrap` provider by default
-- on non-Linux, confined modes fall back to the host provider because `bubblewrap` is Linux-only
+- on non-Linux, confined modes are rejected because the host provider cannot safely enforce them
 
 ## Filesystem Policy
 
@@ -49,34 +70,161 @@ The runtime builds sandbox filesystem policy from the manifest:
 - `mounts.read` becomes host read roots
 - `mounts.write` becomes host write roots
 - `filesystem.exec` becomes executable paths under the staged bundle root
+- `system_tools` resolves named host executables and adds those exact binaries, plus matching PATH aliases such as `/bin/sh` and `/usr/bin/sh`, to the execute allowlist
+- `Bash` also needs a permitted system shell because it executes commands through `sh -lc ...`
+
+Bundle-local exec paths must stay inside the bundle workspace. Absolute paths, `..` traversal, and
+symlink escapes are rejected during manifest validation and checked again after staging.
+
+For host mounts, `.` is treated as a shorthand for the current working directory of the Odyssey
+process. Other mount entries must still be absolute host paths.
+
+Odyssey also mirrors host mounts into the staged bundle workspace so the agent can access them
+through workspace-relative paths:
+
+- `mount/read/current` for a `.` read mount
+- `mount/read/abs/...` for absolute read mounts
+- `mount/write/current` for a `.` write mount
+- `mount/write/abs/...` for absolute write mounts
+
+In confined Linux sandboxes those paths are real bind mounts created by `bubblewrap`. In
+`danger_full_access`, Odyssey materializes the same paths as host symlinks inside the staged app so
+filesystem tools and direct process commands can use the same `mount/...` aliases.
 
 The sandbox cell root itself is always added as a readable root. In `workspace_write` and
 `danger_full_access`, that cell root is also writable.
 
+For runtime-managed cells, Odyssey keeps the staged bundle under `app/` and keeps mutable runtime
+state in separate directories such as `data/`, `cache/`, `tmp/`, and `runs/`.
+
+In confined Linux sandboxes, executable visibility now follows the selected policy strictly:
+
+- `explicit` only mounts declared bundle exec paths and named `system_tools`, plus runtime linker and trust-store support files
+- `standard` mounts the standard host executable roots such as `/usr`, `/bin`, `/sbin`, and `/opt`
+- `all` removes the execute allowlist but still only applies to files already visible inside the sandbox
+
+That split matters because many tools need writable paths even when the bundle itself should remain
+stable:
+
+- `HOME` is used for user-local config, auth state, and tool metadata
+- temp space is used for intermediate files and shell or language runtime behavior
+- caches are used by package managers, compilers, and interpreters
+- per-run scratch directories are used for execution-specific work files and IPC-style data
+
+Without that separation, a confined sandbox would have to choose between making the staged app tree
+writable or letting normal tools fail with permission errors when they try to write under the app
+root. By keeping `app/` separate from writable runtime-owned directories, Odyssey can keep the
+staged bundle read-only in restricted modes while still giving processes safe writable locations.
+
+## Process Execution Policy
+
+For process execution, Odyssey combines:
+
+- filesystem visibility
+- the executable allowlist or exec-root mode
+- tool permission rules from `agent.yaml`
+
+That means these two operations are intentionally governed by different policy paths:
+
+- `Write` can create `hello.py` if the path is writable
+- `Bash` can only run `echo hello > hello.py` if the path is writable and the shell itself is
+  executable in the sandbox
+
+The three system-tool modes mean:
+
+- `explicit` mounts only bundle-local exec paths plus the named `sandbox.system_tools`
+- `standard` exposes common host executable roots such as `/usr` and `/bin`
+- `all` removes the executable allowlist but still does not expose paths outside the sandbox's
+  visible filesystem
+
+Direct operator commands are a separate path from agent tool calls. The runtime uses an operator
+command policy for `run_session_command` and local workflows such as TUI `!ls`, so basic operator
+inspection commands still work in restricted sessions even when the bundle manifest itself uses a
+more restrictive `system_tools_mode: "explicit"`.
+
+## Environment Policy
+
+The bundle manifest can inject environment variables into the sandbox with `sandbox.env`.
+Each entry maps the sandbox variable name to the host variable name to read at runtime.
+
+Example:
+
+```json5
+sandbox: {
+  env: {
+    OPENAI_API_KEY: 'OPENAI_API_KEY',
+    MODEL_ENDPOINT: 'OPENAI_BASE_URL'
+  }
+}
+```
+
+At prepare time, Odyssey reads each host variable from the current process environment and injects
+it into the sandbox under the configured key. Missing host variables are silently skipped.
+
+This behaves like a narrow allowlist. Only variables named in `sandbox.env` and Odyssey's built-in
+safe defaults such as `PATH`, `HOME`, `TMPDIR`, and `ODYSSEY_SANDBOX` are present in the final
+sandbox environment.
+
+This only applies to sandboxed bundle commands. Model-provider credentials such as
+`OPENAI_API_KEY` are read by the runtime process itself, not from the sandbox environment.
+
 ## Network Policy
 
-The current network implementation is intentionally simple:
+The current network implementation is intentionally narrow:
 
-- an empty `sandbox.permissions.network` list disables network access
-- a non-empty list enables outbound network access
+- `sandbox.permissions.network: []` disables outbound network access
+- `sandbox.permissions.network: ["*"]` enables unrestricted outbound network access
 
-The individual strings in that list are not enforced as a hostname allowlist by the current
-sandbox bridge. At the moment the list acts like an on/off switch.
+Hostname allowlists are not implemented in v1. Any other value is rejected during manifest
+validation. For confined Linux sandboxes, network disablement is enforced by `bubblewrap`
+network namespace isolation.
 
-One practical consequence: when the runtime falls back to the host provider and the bundle disables
-network, execution is rejected because the host backend cannot safely emulate that restriction.
+One practical consequence: the host provider is only accepted for `danger_full_access`. Restricted
+bundle sandboxes require the `bubblewrap` backend.
 
 ## Tool Permission Rules
 
-Per-tool rules come from `sandbox.permissions.tools.rules`.
+Per-tool permissions come from `agent.yaml` through `tools.allow`, `tools.ask`, and `tools.deny`.
+
+Matcher syntax:
+
+- `Read` matches the whole tool
+- `Bash(find:*)` matches Bash commands whose normalized prefix starts with `find`
+- `Bash(cargo test:*)` matches Bash commands whose normalized prefix starts with `cargo test`
+- future tools can define their own granular matcher targets, for example `WebFetch(domain:liquidos.ai)`
 
 Important details from the current implementation:
 
 - missing rules default to `allow`
-- `sandbox.permissions.tools.mode` is not interpreted by the runtime yet
 - approval prompts are only generated for tools marked `ask`
+- more specific rules beat broader ones, and ties still resolve by action precedence
+- granular rules like `Bash(curl:*)` still make the `Bash` tool available to the agent
+- malformed tool permission entries are rejected; they do not silently fall back to coarse tool-name matching
 
-## System Tools
+## Approval Behavior
 
-`sandbox.system_tools` is currently used as a preflight dependency check. Before execution starts,
-the runtime verifies that each named binary exists using `which`.
+Tool permission rules can resolve in three ways:
+
+- `allow` runs immediately
+- `deny` fails immediately
+- `ask` emits `PermissionRequested` and pauses until the runtime receives an approval decision
+
+`ApprovalDecision::AllowAlways` is remembered only for the current session. It is cleared when the
+runtime restarts or when the session is deleted.
+
+## Roadmap
+
+The current v1 sandbox roadmap is intentionally conservative:
+
+- keep Linux confined execution centered on `bubblewrap`
+- keep host execution limited to `danger_full_access`
+- keep network semantics limited to `[]` and `["*"]`
+- keep bundle manifests treated as trusted operator-authored policy in v1
+
+That trust assumption is temporary. v2 is expected to treat bundles as untrusted inputs and move
+mounts, env passthrough, system tool access, and similar host-facing capabilities behind stricter
+policy or approval controls.
+
+Landlock is not part of the current v1 runtime contract. It may be revisited later as an optional
+hardening layer, but only if it can be added without making normal sandboxed command execution
+fragile or changing the primary `bubblewrap` confinement model.
