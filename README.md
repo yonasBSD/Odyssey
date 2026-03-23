@@ -1,7 +1,7 @@
-# Odyssey
-
 <div align="center">
   <img src="assets/logo.png" alt="Odyssey logo" width="180" height="180">
+
+  # Odyssey
 
   <p><strong>Define, build, and run agents as portable bundles.</strong></p>
   <p>Open-source Rust runtime for packaging, securing, and operating portable AI agents.</p>
