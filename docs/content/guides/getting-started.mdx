@@ -13,12 +13,28 @@ description: Build, install, and run your first Odyssey bundle locally.
 If you are developing on macOS or Windows, confined bundle sandboxes are not available yet. Use
 `--dangerous-sandbox-mode` for local development or run Odyssey inside a Linux container.
 
+## Install Odyssey
+
+Install the CLI from crates.io:
+
+```bash
+cargo install odyssey-rs
+```
+
+This installs the `odyssey-rs` binary used in the examples below.
+
+If you are working from a source checkout instead, replace `odyssey-rs` with:
+
+```bash
+cargo run -p odyssey-rs --
+```
+
 ## Initialize A Bundle
 
 Create a starter bundle project:
 
 ```bash
-cargo run -p odyssey-rs -- init ./hello-world
+odyssey-rs init ./hello-world
 ```
 
 The template creates a small bundle project:
@@ -47,7 +63,7 @@ bundle policy before you treat a bundle as trusted automation.
 Build a project and install it into the local bundle store:
 
 ```bash
-cargo run -p odyssey-rs -- build ./hello-world
+odyssey-rs build ./hello-world
 ```
 
 Without `--output`, the CLI installs into the runtime cache under:
@@ -59,7 +75,7 @@ Without `--output`, the CLI installs into the runtime cache under:
 Build an OCI-style bundle layout into a custom output directory instead:
 
 ```bash
-cargo run -p odyssey-rs -- build ./hello-world --output ./dist
+odyssey-rs build ./hello-world --output ./dist
 ```
 
 Bundle references accept a few useful forms:
@@ -75,13 +91,13 @@ assistant response, and exits.
 
 ```bash
 export OPENAI_API_KEY="your-key"
-cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?"
+odyssey-rs run hello-world@latest --prompt "What can you do?"
 ```
 
 On macOS, Windows, or whenever you intentionally want host execution for local debugging:
 
 ```bash
-cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?" --dangerous-sandbox-mode
+odyssey-rs run hello-world@latest --prompt "What can you do?" --dangerous-sandbox-mode
 ```
 
 ## Inspect And List
@@ -89,14 +105,14 @@ cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?" --
 Inspect installed bundle metadata:
 
 ```bash
-cargo run -p odyssey-rs -- inspect hello-world@latest
+odyssey-rs inspect hello-world@latest
 ```
 
 List installed bundles and persisted sessions:
 
 ```bash
-cargo run -p odyssey-rs -- bundles
-cargo run -p odyssey-rs -- sessions
+odyssey-rs bundles
+odyssey-rs sessions
 ```
 
 ## Use The TUI
@@ -104,7 +120,7 @@ cargo run -p odyssey-rs -- sessions
 The TUI uses the same local runtime as the CLI:
 
 ```bash
-cargo run -p odyssey-rs -- tui --bundle hello-world@latest
+odyssey-rs tui --bundle hello-world@latest
 ```
 
 Inside the TUI:
@@ -122,13 +138,13 @@ inspection and debugging.
 Run the Axum server on the default bind address:
 
 ```bash
-cargo run -p odyssey-rs -- serve
+odyssey-rs serve
 ```
 
 Or choose a custom bind address:
 
 ```bash
-cargo run -p odyssey-rs -- serve --bind 127.0.0.1:8472
+odyssey-rs serve --bind 127.0.0.1:8472
 ```
 
 The HTTP server wraps the same runtime type that the CLI and TUI use locally.
@@ -162,8 +178,8 @@ The CLI can also target a running server with `--remote` for the commands that s
 execution:
 
 ```bash
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 bundles
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize yourself"
+odyssey-rs --remote http://127.0.0.1:8472 bundles
+odyssey-rs --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize yourself"
 ```
 
 ## What To Read Next

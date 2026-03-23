@@ -10,7 +10,7 @@ categories.workspace = true
 readme.workspace = true
 
 [[bin]]
-name = "odyssey"
+name = "odyssey-rs"
 path = "src/main.rs"
 
 [dependencies]

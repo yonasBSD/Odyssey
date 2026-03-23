@@ -12,6 +12,14 @@ contract across the CLI, TUI, HTTP server, and embedded Rust usage. The bundle d
 the sandbox policy, the available tools, and the runtime defaults; the runtime turns that bundle
 into sessions, turns, events, approvals, and persisted history.
 
+## Install The CLI
+
+```bash
+cargo install odyssey-rs
+```
+
+This installs the `odyssey-rs` binary used throughout the docs.
+
 ## Start Here
 
 - [Getting Started](/getting-started) for the first local bundle workflow
@@ -37,7 +45,7 @@ into sessions, turns, events, approvals, and persisted history.
 | Surface | Best for | Notes |
 | --- | --- | --- |
 | `odyssey-rs run` | One-shot prompts | Creates a fresh session, runs one turn, prints the final response. |
-| `odyssey-rs tui` | Local operator workflows | Uses the same local runtime and support tool approvals, session selection. |
+| `odyssey-rs tui` | Local operator workflows | Uses the same local runtime and supports tool approvals and session selection. |
 | `odyssey-rs serve` | Shared runtime access | Exposes bundle and session APIs over HTTP plus SSE event streaming. |
 | `OdysseyRuntime` | Embedded Rust apps | Gives direct access to bundle, session, execution, and approval APIs. |
 

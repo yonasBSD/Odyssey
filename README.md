@@ -84,15 +84,31 @@ At execution time, Odyssey resolves an `AgentRef` to an installed bundle, create
 The same runtime is available through:
 
 - `odyssey-rs` for CLI workflows
-- `odyssey-rs` `tui` for terminal-native operation
-- `odyssey-rs-server` for HTTP access
+- `odyssey-rs tui` for terminal-native operation
+- `odyssey-rs serve` for HTTP access
+
+## Installation
+
+Install the Odyssey CLI from crates.io:
+
+```bash
+cargo install odyssey-rs
+```
+
+This installs the `odyssey-rs` binary.
+
+If you are working from a source checkout instead, replace `odyssey-rs` in the examples below with:
+
+```bash
+cargo run -p odyssey-rs --
+```
 
 ## Quickstart
 
 ### 1. Initialize a bundle
 
 ```bash
-cargo run -p odyssey-rs -- init ./hello-world
+odyssey-rs init ./hello-world
 ```
 
 This creates a starter project with:
@@ -110,48 +126,48 @@ use.
 ### 2. Build and install locally
 
 ```bash
-cargo run -p odyssey-rs -- build ./hello-world
+odyssey-rs build ./hello-world
 ```
 
 Build to a custom output directory instead:
 
 ```bash
-cargo run -p odyssey-rs -- build ./hello-world --output ./dist
+odyssey-rs build ./hello-world --output ./dist
 ```
 
 ### 3. Run an agent
 
 ```bash
 export OPENAI_API_KEY="your-key"
-cargo run -p odyssey-rs -- run hello-world@latest --prompt "Hey, What are your capabilities?"
+odyssey-rs run hello-world@latest --prompt "Hey, What are your capabilities?"
 ```
 Run the agent in the TUI. The TUI automatically loads installed bundles and handles tools with
 `ASK` policy through the same `odyssey-rs` CLI entrypoint.
 
 ```bash
 export OPENAI_API_KEY="your-key"
-cargo run --release -p odyssey-rs -- tui --bundle hello-world@latest
+odyssey-rs tui --bundle hello-world@latest
 ```
 
 ### 4. Inspect installed metadata
 
 ```bash
-cargo run -p odyssey-rs -- inspect hello-world@latest
+odyssey-rs inspect hello-world@latest
 ```
 
 ### 5. Start the runtime server
 
 ```bash
-cargo run -p odyssey-rs -- serve --bind 127.0.0.1:8472
+odyssey-rs serve --bind 127.0.0.1:8472
 ```
 
 You can then target that runtime remotely:
 
 ```bash
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 bundles
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 inspect hello-world@latest
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize this bundle"
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 sessions
+odyssey-rs --remote http://127.0.0.1:8472 bundles
+odyssey-rs --remote http://127.0.0.1:8472 inspect hello-world@latest
+odyssey-rs --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize this bundle"
+odyssey-rs --remote http://127.0.0.1:8472 sessions
 ```
 
 ## Docker on macOS
@@ -173,7 +189,8 @@ Start an interactive shell in the Linux container:
 docker compose run --rm odyssey
 ```
 
-Inside the container, run the same commands you would run natively:
+Inside the container, the image gives you the source checkout instead of a preinstalled `odyssey-rs`
+binary, so run the CLI from source:
 
 ```bash
 export OPENAI_API_KEY="your-key"
@@ -193,7 +210,7 @@ docker compose run --rm --service-ports odyssey \
 Then connect from the host with:
 
 ```bash
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 bundles
+odyssey-rs --remote http://127.0.0.1:8472 bundles
 ```
 
 If you only need host execution and do not need the Linux sandbox backend, native macOS runs are still possible with `--dangerous-sandbox-mode`.
@@ -203,13 +220,13 @@ If you only need host execution and do not need the Linux sandbox backend, nativ
 Export a portable archive:
 
 ```bash
-cargo run -p odyssey-rs -- export local/hello-world:0.1.0 --output ./dist
+odyssey-rs export local/hello-world:0.1.0 --output ./dist
 ```
 
 Import a portable archive:
 
 ```bash
-cargo run -p odyssey-rs -- import ./dist/hello-world-0.1.0.odyssey
+odyssey-rs import ./dist/hello-world-0.1.0.odyssey
 ```
 
 ## Security Model

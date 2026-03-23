@@ -2,23 +2,31 @@
 
 This is a starter Odyssey bundle.
 
+## Install Odyssey
+
+```bash
+cargo install odyssey-rs
+```
+
+This installs the `odyssey-rs` CLI used in the commands below.
+
 ## Build
 
 ```bash
-cargo run -p odyssey-rs -- build {{ bundle_path }}
+odyssey-rs build {{ bundle_path }}
 ```
 
 Or write the built bundle to a custom directory:
 
 ```bash
-cargo run -p odyssey-rs -- build {{ bundle_path }} --output ./dist
+odyssey-rs build {{ bundle_path }} --output ./dist
 ```
 
 ## Run
 
 ```bash
 export OPENAI_API_KEY="your-key"
-cargo run -p odyssey-rs -- run {{ bundle_id }}@latest --prompt "Hey, What is your name?"
+odyssey-rs run {{ bundle_id }}@latest --prompt "Hey, What is your name?"
 ```
 
 ## Starter Template Defaults

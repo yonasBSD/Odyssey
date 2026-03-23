@@ -6,6 +6,15 @@ description: Command-line and HTTP reference for Odyssey bundle and session work
 
 ## CLI Commands
 
+Install the CLI from crates.io:
+
+```bash
+cargo install odyssey-rs
+```
+
+This installs the `odyssey-rs` binary. If you are working from a source checkout instead, replace
+`odyssey-rs` below with `cargo run -p odyssey-rs --`.
+
 Odyssey's main entrypoint is `odyssey-rs`.
 
 | Command | Purpose | `--remote` support | Notes |
@@ -29,19 +38,19 @@ Odyssey's main entrypoint is `odyssey-rs`.
 Initialize, build, inspect, and run a local bundle:
 
 ```bash
-cargo run -p odyssey-rs -- init ./hello-world
-cargo run -p odyssey-rs -- build ./hello-world
-cargo run -p odyssey-rs -- inspect hello-world@latest
-cargo run -p odyssey-rs -- run hello-world@latest --prompt "What can you do?"
+odyssey-rs init ./hello-world
+odyssey-rs build ./hello-world
+odyssey-rs inspect hello-world@latest
+odyssey-rs run hello-world@latest --prompt "What can you do?"
 ```
 
 Start a server and target it remotely:
 
 ```bash
-cargo run -p odyssey-rs -- serve
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 bundles
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 inspect hello-world@latest
-cargo run -p odyssey-rs -- --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize yourself"
+odyssey-rs serve
+odyssey-rs --remote http://127.0.0.1:8472 bundles
+odyssey-rs --remote http://127.0.0.1:8472 inspect hello-world@latest
+odyssey-rs --remote http://127.0.0.1:8472 run hello-world@latest --prompt "Summarize yourself"
 ```
 
 For local-only debugging, the CLI also supports `--dangerous-sandbox-mode` on `run`, `serve`, and
