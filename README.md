@@ -297,6 +297,12 @@ cargo tarpaulin --engine llvm --skip-clean --workspace --all-features --timeout 
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow, quality expectations, and pull request guidance.
 
+## Community
+
+- **GitHub Issues**: Bug reports and feature requests
+- **Discussions**: Community Q&A and ideas
+- **Discord**: Join our Discord Community using https://discord.gg/zfAF9MkEtK
+
 ## License
 
 Odyssey is licensed under Apache 2.0. See [APACHE_LICENSE](APACHE_LICENSE).
