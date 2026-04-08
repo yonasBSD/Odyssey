@@ -6,17 +6,17 @@ use odyssey_rs_manifest::{AgentSpec, BundleManifest};
 pub struct LoadedBundle {
     pub install: BundleInstall,
     pub manifest: BundleManifest,
-    pub agent: AgentSpec,
+    pub agents: Vec<AgentSpec>,
 }
 
 pub fn load_bundle(store: &BundleStore, reference: &str) -> Result<LoadedBundle, RuntimeError> {
     let install = store.resolve(reference)?;
     let manifest = install.metadata.bundle_manifest.clone();
-    let agent = install.metadata.agent_spec.clone();
+    let agents = install.metadata.agents.clone();
     Ok(LoadedBundle {
         install,
         manifest,
-        agent,
+        agents,
     })
 }
 
@@ -29,44 +29,62 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_bundle_project(root: &std::path::Path, id: &str, version: &str) {
+        let agent_root = root.join("agents").join(id);
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skills");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(agent_root.join("schemas")).expect("create agent schemas");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{id}",
-                    version: "{version}",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "repo-hygiene", path: "skills/repo-hygiene" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: []
-                        }},
-                        system_tools: [],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {id}
+  version: {version}
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: repo-hygiene
+      path: skills/repo-hygiene
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network: []
+    system_tools: []
+    resources: {{}}
+  agents:
+    - id: {id}
+      spec: agents/{id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {id}
-description: runtime loader test
-prompt: keep responses concise
-model:
-  provider: openai
-  name: gpt-4.1-mini
-tools:
-  allow: ["Read"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {id}
+  version: {version}
+  description: runtime loader test
+spec:
+  kind: prompt
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  tools:
+    allow: ["Read"]
 "#
             ),
         )
@@ -95,7 +113,7 @@ tools:
         assert_eq!(loaded.install.path, install.path);
         assert_eq!(loaded.manifest.id, "demo");
         assert_eq!(loaded.manifest.version, "0.1.0");
-        assert_eq!(loaded.agent.id, "demo");
+        assert_eq!(loaded.agents[0].id, "demo");
     }
 
     #[test]

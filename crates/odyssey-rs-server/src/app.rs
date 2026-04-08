@@ -42,7 +42,7 @@ mod tests {
     use super::build_app;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use odyssey_rs_protocol::SandboxMode;
+    use odyssey_rs_protocol::{DEFAULT_HUB_URL, SandboxMode};
     use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -56,9 +56,10 @@ mod tests {
             sandbox_root: root.join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: Some(SandboxMode::DangerFullAccess),
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            ..RuntimeConfig::default()
         }
     }
 

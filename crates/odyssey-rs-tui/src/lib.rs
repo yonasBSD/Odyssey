@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 pub struct TuiRunConfig {
     /// Bundle reference used for all sessions in the UI.
     pub bundle_ref: String,
-    /// Optional working directory shown in the header.
+    /// Optional working directory shown in the header and used to resolve relative bundle paths.
     pub cwd: Option<PathBuf>,
 }
 
@@ -64,7 +64,6 @@ pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::
         app.push_status("install a local bundle to get started");
     } else {
         let bundle = bundle_store.resolve(&app.bundle_ref)?.metadata;
-        app.set_active_model(bundle.agent_spec.model.name.clone());
         app.set_active_agent(bundle.agent_spec.id.clone());
 
         let agents = client.list_agents().await?;
@@ -133,6 +132,7 @@ fn bundle_summary_ref(bundle: BundleInstallSummary) -> String {
 mod tests {
     use super::{TuiRunConfig, bundle_summary_ref, resolve_bundle_ref};
     use odyssey_rs_bundle::BundleInstallSummary;
+    use odyssey_rs_protocol::DEFAULT_HUB_URL;
     use odyssey_rs_runtime::{RuntimeConfig, RuntimeEngine};
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -146,51 +146,71 @@ mod tests {
             sandbox_root: root.join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: None,
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            ..RuntimeConfig::default()
         }
     }
 
     fn write_bundle_project(root: &Path, bundle_id: &str) {
+        let agent_root = root.join("agents").join(bundle_id);
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{bundle_id}",
-                    version: "0.1.0",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "repo-hygiene", path: "skills/repo-hygiene" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: []
-                        }},
-                        system_tools: [],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: repo-hygiene
+      path: skills/repo-hygiene
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network: []
+    system_tools: []
+    resources: {{}}
+  agents:
+    - id: {bundle_id}
+      spec: agents/{bundle_id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {bundle_id}
-description: test bundle
-prompt: keep responses concise
-model:
-  provider: openai
-  name: gpt-4.1-mini
-tools:
-  allow: ["Read", "Skill"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+  description: test bundle
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  tools:
+    allow: ["Read", "Skill"]
 "#
             ),
         )

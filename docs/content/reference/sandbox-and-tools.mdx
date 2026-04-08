@@ -79,6 +79,32 @@ symlink escapes are rejected during manifest validation and checked again after 
 For host mounts, `.` is treated as a shorthand for the current working directory of the Odyssey
 process. Other mount entries must still be absolute host paths.
 
+Operators can add per-agent runtime mounts through `~/.odyssey/config.yml` without changing the
+bundle itself. The supported path is:
+
+```yaml
+bundles:
+  "hello-world@latest":
+    agents:
+      "hello-world":
+        sandbox:
+          permissions:
+            filesystem:
+              mounts:
+                read:
+                  - "."
+                  - "/home/vishwak/data"
+                write:
+                  - "/tmp/odyssey-out"
+```
+
+Those agent-level config mounts are applied automatically when a session is created for the matching
+installed bundle and agent. If the caller also passes `SessionSpec.sandbox`, Odyssey merges that on
+top of the user config and persists the final overlay in the session record.
+
+Both `mounts.read` and `mounts.write` entries must already exist on the host. If a configured mount
+source is missing, sandbox startup fails with an invalid-configuration error.
+
 Odyssey also mirrors host mounts into the staged bundle workspace so the agent can access them
 through workspace-relative paths:
 
@@ -167,6 +193,10 @@ sandbox environment.
 
 This only applies to sandboxed bundle commands. Model-provider credentials such as
 `OPENAI_API_KEY` are read by the runtime process itself, not from the sandbox environment.
+
+User config can also add session-level environment passthrough through
+`bundles."<bundle-ref>".agents."<agent-id>".sandbox.env`. Those values are merged on top of the bundle
+defaults when the session is created.
 
 ## Network Policy
 

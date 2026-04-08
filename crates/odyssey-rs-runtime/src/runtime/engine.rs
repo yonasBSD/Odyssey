@@ -1,7 +1,10 @@
 use super::scheduler::ExecutionScheduler;
 use super::templates::initialize_bundle;
 use super::tool_event::RuntimeToolEventSink;
-use crate::resolver::bundle::resolve_bundle_from_ref;
+use crate::resolver::{
+    bundle::resolve_bundle_from_ref,
+    llm::{DynLLMProvider, LLMProvider, LLMResolver, LocalLLMProvider},
+};
 use crate::sandbox::{build_permission_rules, build_sandbox_runtime};
 use crate::session::{ApprovalStore, SessionRecord, SessionStore, TurnChatMessageKind};
 use crate::skill::BundleSkillStore;
@@ -12,16 +15,17 @@ use odyssey_rs_bundle::{
 };
 use odyssey_rs_protocol::SandboxMode;
 use odyssey_rs_protocol::{
-    BundleRef, EventMsg, ExecutionHandle, ExecutionRequest, ExecutionStatus, Message, Role,
-    Session, SessionFilter, SessionSpec, SessionSummary, SkillSummary,
+    BundleRef, EventMsg, ExecutionHandle, ExecutionRequest, ExecutionStatus, Message, ModelSpec,
+    Role, Session, SessionFilter, SessionSpec, SessionSummary, SkillSummary,
 };
 use odyssey_rs_sandbox::SandboxRuntime;
 use odyssey_rs_tools::{SkillProvider, ToolContext, ToolRegistry, ToolSandbox, builtin_registry};
 use parking_lot::Mutex;
 use std::collections::{HashMap, hash_map::Entry};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{OnceCell, broadcast};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -87,6 +91,92 @@ impl SessionExecutionGuards {
     }
 }
 
+struct AsyncInitCache<T> {
+    entries: Mutex<HashMap<String, Arc<OnceCell<T>>>>,
+}
+
+impl<T> Default for AsyncInitCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T: Clone> AsyncInitCache<T> {
+    fn cell(&self, key: impl Into<String>) -> Arc<OnceCell<T>> {
+        let key = key.into();
+        let mut entries = self.entries.lock();
+        entries
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    }
+
+    fn remove_if_match(&self, key: &str, cell: &Arc<OnceCell<T>>) {
+        let mut entries = self.entries.lock();
+        if let Some(current) = entries.get(key)
+            && Arc::ptr_eq(current, cell)
+            && current.get().is_none()
+        {
+            entries.remove(key);
+        }
+    }
+
+    async fn get_or_try_init<E, Fut, F>(&self, key: &str, init: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let cell = self.cell(key.to_string());
+        match cell.get_or_try_init(init).await {
+            Ok(value) => Ok(value.clone()),
+            Err(err) => {
+                self.remove_if_match(key, &cell);
+                Err(err)
+            }
+        }
+    }
+}
+
+type LlamaCppProviderCache = AsyncInitCache<DynLLMProvider>;
+
+fn canonicalize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut normalized = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                normalized.insert(key, canonicalize_json_value(value));
+            }
+            serde_json::Value::Object(normalized)
+        }
+        value => value,
+    }
+}
+
+fn llama_cpp_cache_key(model: &ModelSpec) -> Result<String, RuntimeError> {
+    let config = model
+        .config
+        .clone()
+        .map(canonicalize_json_value)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::to_string(&serde_json::json!({
+        "provider": "llama_cpp",
+        "name": model.name,
+        "config": config,
+    }))
+    .map_err(|err| {
+        RuntimeError::Executor(format!(
+            "failed to serialize llama.cpp model cache key: {err}"
+        ))
+    })
+}
+
 pub(crate) struct OdysseyRuntimeInner {
     pub(crate) config: RuntimeConfig,
     pub(crate) store: BundleStore,
@@ -95,6 +185,7 @@ pub(crate) struct OdysseyRuntimeInner {
     pub(crate) restricted_sandbox: Arc<SandboxRuntime>,
     pub(crate) tools: ToolRegistry,
     pub(crate) approvals: ApprovalStore,
+    llama_cpp_providers: LlamaCppProviderCache,
     execution_guards: SessionExecutionGuards,
 }
 
@@ -126,6 +217,7 @@ impl OdysseyRuntime {
             restricted_sandbox,
             tools: builtin_registry(),
             approvals: ApprovalStore::default(),
+            llama_cpp_providers: LlamaCppProviderCache::default(),
             execution_guards: SessionExecutionGuards::default(),
         });
         let scheduler = ExecutionScheduler::new(inner.clone(), worker_count, queue_capacity);
@@ -195,23 +287,65 @@ impl OdysseyRuntime {
         &self,
         bundle_ref: impl Into<BundleRef>,
     ) -> Result<Vec<String>, RuntimeError> {
-        let resolved = resolve_bundle_from_ref(&self.inner.store, &bundle_ref.into())?;
-        Ok(vec![resolved.default_agent.id])
+        let resolved = resolve_bundle_from_ref(
+            &self.inner.store,
+            &bundle_ref.into(),
+            None,
+            &self.inner.config.default_model,
+        )?;
+        Ok(resolved.agents.into_iter().map(|agent| agent.id).collect())
     }
 
     pub fn list_models(
         &self,
         bundle_ref: impl Into<BundleRef>,
     ) -> Result<Vec<String>, RuntimeError> {
-        let resolved = resolve_bundle_from_ref(&self.inner.store, &bundle_ref.into())?;
-        Ok(vec![resolved.default_agent.model.name])
+        let resolved = resolve_bundle_from_ref(
+            &self.inner.store,
+            &bundle_ref.into(),
+            None,
+            &self.inner.config.default_model,
+        )?;
+        let mut models = resolved
+            .agents
+            .into_iter()
+            .map(|agent| {
+                let base_model = if agent.model.provider.trim().is_empty()
+                    || agent.model.name.trim().is_empty()
+                {
+                    self.inner.config.default_model.clone()
+                } else {
+                    agent.model.clone()
+                };
+                self.inner.config.session_model_for_agent(
+                    &resolved.namespace,
+                    &resolved.manifest.id,
+                    &resolved.manifest.version,
+                    &agent.id,
+                    &base_model,
+                    None,
+                )
+            })
+            .map(|model| model.name)
+            .collect::<Vec<_>>();
+        if models.is_empty() {
+            models.push(self.inner.config.default_model.name.clone());
+        }
+        models.sort();
+        models.dedup();
+        Ok(models)
     }
 
     pub fn list_skills(
         &self,
         bundle_ref: impl Into<BundleRef>,
     ) -> Result<Vec<SkillSummary>, RuntimeError> {
-        let resolved = resolve_bundle_from_ref(&self.inner.store, &bundle_ref.into())?;
+        let resolved = resolve_bundle_from_ref(
+            &self.inner.store,
+            &bundle_ref.into(),
+            None,
+            &self.inner.config.default_model,
+        )?;
         let store = BundleSkillStore::load(&resolved.install_path)?;
         Ok(store
             .list()
@@ -229,14 +363,34 @@ impl OdysseyRuntime {
         spec: impl Into<SessionSpec>,
     ) -> Result<SessionSummary, RuntimeError> {
         let spec = spec.into();
-        let resolved = resolve_bundle_from_ref(&self.inner.store, &spec.bundle_ref)?;
-        let model = spec.model.unwrap_or_else(|| resolved.model.clone());
+        let resolved = resolve_bundle_from_ref(
+            &self.inner.store,
+            &spec.bundle_ref,
+            spec.agent_id.as_deref(),
+            &self.inner.config.default_model,
+        )?;
+        let model = self.inner.config.session_model_for_agent(
+            &resolved.namespace,
+            &resolved.manifest.id,
+            &resolved.manifest.version,
+            &resolved.agent.id,
+            &resolved.model,
+            spec.model.as_ref(),
+        );
+        let sandbox = self.inner.config.session_sandbox_for_agent(
+            &resolved.namespace,
+            &resolved.manifest.id,
+            &resolved.manifest.version,
+            &resolved.agent.id,
+            spec.sandbox.as_ref(),
+        );
         let record = self.inner.sessions.create(
             spec.bundle_ref.to_string(),
-            resolved.default_agent.id,
+            resolved.agent.id,
             model.provider,
             model.name,
             model.config,
+            sandbox,
         )?;
         Ok(summary_from_record(&record))
     }
@@ -330,10 +484,15 @@ impl OdysseyRuntime {
 
         let _session_guard = self.inner.lock_session_execution(session_id).await;
         let session = self.inner.sessions.get(session_id)?;
-        let resolved =
-            resolve_bundle_from_ref(&self.inner.store, &BundleRef::from(session.bundle_ref))?;
+        let resolved = resolve_bundle_from_ref(
+            &self.inner.store,
+            &BundleRef::from(session.bundle_ref),
+            Some(&session.agent_id),
+            &self.inner.config.default_model,
+        )?;
         let mode = super::executor::effective_sandbox_mode(
             &resolved.manifest,
+            session.sandbox.as_ref(),
             self.inner.config.sandbox_mode_override,
         );
         debug!("Effective Sandbox mode: {:?}", mode);
@@ -341,6 +500,7 @@ impl OdysseyRuntime {
             &mode,
             &self.inner,
             &resolved,
+            session.sandbox.as_ref(),
             session_id,
         )
         .await?;
@@ -369,7 +529,7 @@ impl OdysseyRuntime {
                 handle: cell.sandbox.handle,
                 lease: cell.sandbox.lease,
             },
-            permission_rules: build_permission_rules(&resolved.default_agent)?,
+            permission_rules: build_permission_rules(&resolved.agent)?,
             event_sink: Some(event_sink),
             approval_handler: Some(approval_handler),
             skills: None,
@@ -510,31 +670,56 @@ fn session_from_record(record: SessionRecord) -> Session {
         agent_id: record.agent_id,
         bundle_ref: record.bundle_ref,
         model_id: record.model_id,
+        sandbox: record.sandbox,
         created_at: record.created_at,
         messages,
+    }
+}
+
+impl OdysseyRuntimeInner {
+    pub(crate) async fn resolve_llm(
+        &self,
+        model: &ModelSpec,
+    ) -> Result<DynLLMProvider, RuntimeError> {
+        match LLMProvider::from(model.provider.as_str()) {
+            LLMProvider::Local(LocalLLMProvider::LlamaCpp) => {
+                let key = llama_cpp_cache_key(model)?;
+                self.llama_cpp_providers
+                    .get_or_try_init(&key, || async { LLMResolver::new(model).build_llm().await })
+                    .await
+            }
+            _ => LLMResolver::new(model).build_llm().await,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionExecutionGuards, build_sandbox_runtime, build_session_command_spec,
-        session_from_record, summary_from_record,
+        AsyncInitCache, SessionExecutionGuards, build_sandbox_runtime, build_session_command_spec,
+        llama_cpp_cache_key, session_from_record, summary_from_record,
     };
-    use crate::OdysseyRuntime;
-    use crate::RuntimeConfig;
     use crate::session::{SessionRecord, TurnChatMessageKind, TurnChatMessageRecord, TurnRecord};
+    use crate::{AgentRuntimeConfig, BundleRuntimeConfig, OdysseyRuntime, RuntimeConfig};
     use autoagents_llm::chat::ChatRole;
     use autoagents_llm::{FunctionCall, ToolCall};
     use chrono::Utc;
-    use odyssey_rs_protocol::Task;
-    use odyssey_rs_protocol::{EventPayload, Role, SandboxMode};
+    use odyssey_rs_protocol::{
+        DEFAULT_HUB_URL, EventPayload, Role, SandboxMode, SessionSandboxFilesystem,
+        SessionSandboxMounts, SessionSandboxOverlay, SessionSandboxPermissions, SessionSpec,
+    };
+    use odyssey_rs_protocol::{ModelSpec, Task};
     use odyssey_rs_sandbox::{HostExecProvider, SandboxHandle};
     use odyssey_rs_tools::{ToolContext, ToolSandbox};
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::tempdir;
     use tokio::sync::broadcast;
     use tokio::time::{Duration, timeout};
@@ -558,6 +743,7 @@ mod tests {
             model_provider: "openai".to_string(),
             model_id: "gpt-4.1-mini".to_string(),
             model_config: None,
+            sandbox: None,
             created_at: Utc::now(),
             turns: vec![
                 TurnRecord {
@@ -618,9 +804,15 @@ mod tests {
             sandbox_root: temp.path().join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: None,
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            default_model: odyssey_rs_protocol::ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-4.1-mini".to_string(),
+                config: None,
+            },
+            bundle_overrides: BTreeMap::new(),
         };
 
         let runtime =
@@ -630,6 +822,102 @@ mod tests {
         assert_eq!(runtime.storage_root(), config.sandbox_root.as_path());
     }
 
+    #[tokio::test]
+    async fn async_init_cache_initializes_once_per_key() {
+        let cache = Arc::new(AsyncInitCache::<usize>::default());
+        let init_count = Arc::new(AtomicUsize::new(0));
+
+        let left_cache = cache.clone();
+        let left_count = init_count.clone();
+        let right_cache = cache.clone();
+        let right_count = init_count.clone();
+
+        let left = tokio::spawn(async move {
+            left_cache
+                .get_or_try_init("same-key", || async move {
+                    left_count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok::<usize, &'static str>(42)
+                })
+                .await
+        });
+        let right = tokio::spawn(async move {
+            right_cache
+                .get_or_try_init("same-key", || async move {
+                    right_count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok::<usize, &'static str>(42)
+                })
+                .await
+        });
+
+        assert_eq!(left.await.expect("left join").expect("left init"), 42);
+        assert_eq!(right.await.expect("right join").expect("right init"), 42);
+        assert_eq!(init_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn async_init_cache_retries_after_failure() {
+        let cache = AsyncInitCache::<usize>::default();
+        let init_count = AtomicUsize::new(0);
+
+        let err = cache
+            .get_or_try_init("same-key", || async {
+                init_count.fetch_add(1, Ordering::SeqCst);
+                Err::<usize, &'static str>("boom")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, "boom");
+
+        let value = cache
+            .get_or_try_init("same-key", || async {
+                init_count.fetch_add(1, Ordering::SeqCst);
+                Ok::<usize, &'static str>(7)
+            })
+            .await
+            .expect("retry init");
+        assert_eq!(value, 7);
+        assert_eq!(init_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn llama_cpp_cache_key_normalizes_provider_aliases_and_config_order() {
+        let first = ModelSpec {
+            provider: "llama_cpp".to_string(),
+            name: "qwen-local".to_string(),
+            config: Some(json!({
+                "hf_repo_id": "unsloth/Qwen3.5-9B-GGUF",
+                "extra_body": {
+                    "chat_template_kwargs": {
+                        "b": 2,
+                        "a": 1
+                    }
+                },
+                "n_threads": 8
+            })),
+        };
+        let second = ModelSpec {
+            provider: "llama-cpp".to_string(),
+            name: "qwen-local".to_string(),
+            config: Some(json!({
+                "n_threads": 8,
+                "extra_body": {
+                    "chat_template_kwargs": {
+                        "a": 1,
+                        "b": 2
+                    }
+                },
+                "hf_repo_id": "unsloth/Qwen3.5-9B-GGUF"
+            })),
+        };
+
+        assert_eq!(
+            llama_cpp_cache_key(&first).expect("first cache key"),
+            llama_cpp_cache_key(&second).expect("second cache key")
+        );
+    }
+
     fn runtime_config(root: &Path) -> RuntimeConfig {
         RuntimeConfig {
             cache_root: root.join("cache"),
@@ -637,51 +925,74 @@ mod tests {
             sandbox_root: root.join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: Some(SandboxMode::DangerFullAccess),
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            default_model: odyssey_rs_protocol::ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-4.1-mini".to_string(),
+                config: None,
+            },
+            bundle_overrides: BTreeMap::new(),
         }
     }
 
     fn write_bundle_project(root: &Path, bundle_id: &str, agent_id: &str) {
+        let agent_root = root.join("agents").join(agent_id);
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{bundle_id}",
-                    version: "0.1.0",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "repo-hygiene", path: "skills/repo-hygiene" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: ["*"]
-                        }},
-                        system_tools: ["sh"],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+spec:
+  abiVersion: v1
+  skills:
+    - name: repo-hygiene
+      path: skills/repo-hygiene
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network:
+        - "*"
+    system_tools:
+      - sh
+  agents:
+    - id: {agent_id}
+      spec: agents/{agent_id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {agent_id}
-description: test bundle
-prompt: keep responses concise
-model:
-  provider: openai
-  name: gpt-4.1-mini
-tools:
-  allow: ["Read", "Skill"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {agent_id}
+  version: 0.1.0
+spec:
+  kind: prompt
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  tools:
+    allow: ["Read", "Skill"]
 "#
             ),
         )
@@ -707,44 +1018,61 @@ tools:
     ) {
         let read_mounts =
             serde_json::to_string(&vec![read_mount.display().to_string()]).expect("read mounts");
+        let agent_root = root.join("agents").join(agent_id);
         fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{bundle_id}",
-                    version: "0.1.0",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "repo-hygiene", path: "skills/repo-hygiene" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: {read_mounts}, write: [] }} }},
-                            network: ["*"]
-                        }},
-                        system_tools: ["sh"],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+spec:
+  abiVersion: v1
+  skills:
+    - name: repo-hygiene
+      path: skills/repo-hygiene
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: {read_mounts}
+          write: []
+      network:
+        - "*"
+    system_tools:
+      - sh
+  agents:
+    - id: {agent_id}
+      spec: agents/{agent_id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {agent_id}
-description: test bundle
-prompt: keep responses concise
-model:
-  provider: openai
-  name: gpt-4.1-mini
-tools:
-  allow: ["Read", "Skill"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {agent_id}
+  version: 0.1.0
+spec:
+  kind: prompt
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  tools:
+    allow: ["Read", "Skill"]
 "#
             ),
         )
@@ -905,6 +1233,98 @@ tools:
         .expect("different sessions should not block");
     }
 
+    #[test]
+    fn create_session_merges_project_agent_sandbox_override() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = runtime_config(temp.path());
+        config.bundle_overrides.insert(
+            "alpha@latest".to_string(),
+            BundleRuntimeConfig {
+                agents: BTreeMap::from([(
+                    "alpha-agent".to_string(),
+                    AgentRuntimeConfig {
+                        model: Some("gpt-5.4".to_string()),
+                        model_provider: Some("openai".to_string()),
+                        model_config: Some(serde_json::json!({
+                            "reasoning_effort": "high"
+                        })),
+                        sandbox: Some(SessionSandboxOverlay {
+                            mode: Some(SandboxMode::ReadOnly),
+                            permissions: SessionSandboxPermissions {
+                                filesystem: SessionSandboxFilesystem {
+                                    exec: vec!["/usr/bin".to_string()],
+                                    mounts: SessionSandboxMounts {
+                                        read: vec!["/configured-read".to_string()],
+                                        write: Vec::new(),
+                                    },
+                                },
+                            },
+                            env: BTreeMap::from([(
+                                "TOKEN".to_string(),
+                                "CONFIG_TOKEN".to_string(),
+                            )]),
+                            system_tools: vec!["git".to_string()],
+                        }),
+                    },
+                )]),
+            },
+        );
+        let runtime = OdysseyRuntime::new(config).expect("runtime");
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let session = runtime
+            .create_session(SessionSpec {
+                bundle_ref: "local/alpha@0.1.0".into(),
+                agent_id: Some("alpha-agent".to_string()),
+                model: None,
+                sandbox: Some(SessionSandboxOverlay {
+                    mode: None,
+                    permissions: SessionSandboxPermissions {
+                        filesystem: SessionSandboxFilesystem {
+                            exec: vec!["/opt/bin".to_string()],
+                            mounts: SessionSandboxMounts {
+                                read: vec!["/explicit-read".to_string()],
+                                write: vec!["/odyssey-test/output".to_string()],
+                            },
+                        },
+                    },
+                    env: BTreeMap::from([("TOKEN".to_string(), "EXPLICIT_TOKEN".to_string())]),
+                    system_tools: vec!["python3".to_string()],
+                }),
+                metadata: serde_json::json!({}),
+            })
+            .expect("create session");
+
+        let persisted = runtime.get_session(session.id).expect("load session");
+        let sandbox = persisted.sandbox.expect("persisted sandbox");
+
+        assert_eq!(persisted.model_id, "gpt-5.4");
+        assert_eq!(sandbox.mode, Some(SandboxMode::ReadOnly));
+        assert_eq!(
+            sandbox.permissions.filesystem.exec,
+            vec!["/usr/bin".to_string(), "/opt/bin".to_string()]
+        );
+        assert_eq!(
+            sandbox.permissions.filesystem.mounts.read,
+            vec!["/configured-read".to_string(), "/explicit-read".to_string()]
+        );
+        assert_eq!(
+            sandbox.permissions.filesystem.mounts.write,
+            vec!["/odyssey-test/output".to_string()]
+        );
+        assert_eq!(
+            sandbox.env.get("TOKEN"),
+            Some(&"EXPLICIT_TOKEN".to_string())
+        );
+        assert_eq!(
+            sandbox.system_tools,
+            vec!["git".to_string(), "python3".to_string()]
+        );
+    }
+
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn run_session_command_executes_and_streams_exec_events() {
@@ -1016,7 +1436,8 @@ tools:
             .expect("run command");
 
         assert_eq!(output.status_code, Some(0));
-        assert!(output.stdout.contains("agent.yaml"));
+        assert!(output.stdout.contains("odyssey.bundle.yaml"));
+        assert!(output.stdout.contains("agents"));
     }
 
     #[tokio::test]

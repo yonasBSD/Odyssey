@@ -116,8 +116,10 @@ async fn publish_and_pull_round_trip_through_hub_api() {
     assert_eq!(pulled.metadata.version, install.metadata.version);
     assert_eq!(pulled.metadata.digest, published.digest);
     assert_eq!(
-        fs::read_to_string(pulled.path.join("agent.yaml")).expect("read pulled agent"),
-        fs::read_to_string(install.path.join("agent.yaml")).expect("read built agent")
+        fs::read_to_string(pulled.path.join("agents").join("demo").join("agent.yaml"))
+            .expect("read pulled agent"),
+        fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+            .expect("read built agent")
     );
 
     let by_digest = consumer_store

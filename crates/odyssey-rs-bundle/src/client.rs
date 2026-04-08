@@ -159,8 +159,21 @@ impl HubClient {
             version: config.version.clone(),
             digest: response.version.manifest_digest.clone(),
             readme: config.readme.clone(),
+            agent_spec: config
+                .agents
+                .iter()
+                .find(|agent| {
+                    Some(agent.id.as_str()) == config.bundle_manifest.default_agent_entry_id()
+                })
+                .cloned()
+                .or_else(|| config.agents.first().cloned())
+                .ok_or_else(|| {
+                    HubClientError::InvalidResponse(
+                        "bundle config does not contain any agents".to_string(),
+                    )
+                })?,
             bundle_manifest: config.bundle_manifest,
-            agent_spec: config.agent_spec,
+            agents: config.agents,
         };
         Ok(PullBundleResponse {
             index_bytes: build_index_bytes(

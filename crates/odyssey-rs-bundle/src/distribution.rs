@@ -62,7 +62,18 @@ pub async fn publish_layout(
         digest: manifest_digest.clone(),
         readme: config.readme.clone(),
         bundle_manifest: config.bundle_manifest.clone(),
-        agent_spec: config.agent_spec.clone(),
+        agent_spec: config
+            .agents
+            .iter()
+            .find(|agent| {
+                Some(agent.id.as_str()) == config.bundle_manifest.default_agent_entry_id()
+            })
+            .cloned()
+            .or_else(|| config.agents.first().cloned())
+            .ok_or_else(|| {
+                BundleError::Invalid("bundle config does not contain any agents".to_string())
+            })?,
+        agents: config.agents.clone(),
     };
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {

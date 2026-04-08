@@ -1,0 +1,28 @@
+[package]
+name = "odyssey-rs-agent-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+odyssey-rs-agent-abi.workspace = true
+async-trait.workspace = true
+autoagents-core.workspace = true
+autoagents-llm.workspace = true
+autoagents-protocol.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wit-bindgen = "0.51.0"
+
+[dev-dependencies]
+odyssey-rs-protocol.workspace = true
+pretty_assertions.workspace = true
+tokio.workspace = true

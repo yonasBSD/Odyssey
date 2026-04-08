@@ -9,6 +9,7 @@ pub use tool::ToolError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub type SessionId = Uuid;
@@ -18,6 +19,9 @@ pub type ExecId = Uuid;
 
 pub use autoagents_protocol::Task;
 pub use autoagents_protocol::{Event as AutoAgentsEvent, StreamChunk as AutoAgentsStreamChunk};
+
+pub const DEFAULT_RUNTIME_BIND_ADDR: &str = "127.0.0.1:8472";
+pub const DEFAULT_HUB_URL: &str = "http://127.0.0.1:8473";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct BundleRef {
@@ -82,15 +86,95 @@ pub struct Session {
     pub agent_id: String,
     pub bundle_ref: String,
     pub model_id: String,
+    #[serde(default)]
+    pub sandbox: Option<SessionSandboxOverlay>,
     pub created_at: DateTime<Utc>,
     pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSandboxOverlay {
+    #[serde(default)]
+    pub mode: Option<SandboxMode>,
+    #[serde(default)]
+    pub permissions: SessionSandboxPermissions,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub system_tools: Vec<String>,
+}
+
+impl SessionSandboxOverlay {
+    pub fn merge(
+        base: Option<&SessionSandboxOverlay>,
+        overlay: Option<&SessionSandboxOverlay>,
+    ) -> Option<SessionSandboxOverlay> {
+        match (base, overlay) {
+            (None, None) => None,
+            (Some(base), None) => Some(base.clone()),
+            (None, Some(overlay)) => Some(overlay.clone()),
+            (Some(base), Some(overlay)) => {
+                let mut merged = base.clone();
+                if overlay.mode.is_some() {
+                    merged.mode = overlay.mode;
+                }
+                merge_unique(
+                    &mut merged.permissions.filesystem.exec,
+                    &overlay.permissions.filesystem.exec,
+                );
+                merge_unique(
+                    &mut merged.permissions.filesystem.mounts.read,
+                    &overlay.permissions.filesystem.mounts.read,
+                );
+                merge_unique(
+                    &mut merged.permissions.filesystem.mounts.write,
+                    &overlay.permissions.filesystem.mounts.write,
+                );
+                for (key, value) in &overlay.env {
+                    merged.env.insert(key.clone(), value.clone());
+                }
+                merge_unique(&mut merged.system_tools, &overlay.system_tools);
+                Some(merged)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSandboxPermissions {
+    #[serde(default)]
+    pub filesystem: SessionSandboxFilesystem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSandboxFilesystem {
+    #[serde(default)]
+    pub exec: Vec<String>,
+    #[serde(default)]
+    pub mounts: SessionSandboxMounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSandboxMounts {
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub bundle_ref: BundleRef,
     #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
     pub model: Option<ModelSpec>,
+    #[serde(default)]
+    pub sandbox: Option<SessionSandboxOverlay>,
     #[serde(default = "empty_json_object")]
     pub metadata: Value,
 }
@@ -105,7 +189,9 @@ impl From<&str> for SessionSpec {
     fn from(value: &str) -> Self {
         Self {
             bundle_ref: BundleRef::from(value),
+            agent_id: None,
             model: None,
+            sandbox: None,
             metadata: empty_json_object(),
         }
     }
@@ -283,7 +369,7 @@ pub struct TurnContextOverride {
     pub model: Option<ModelSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     pub provider: String,
@@ -351,11 +437,110 @@ fn empty_json_object() -> Value {
     Value::Object(Map::new())
 }
 
+fn merge_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.contains(value) {
+            target.push(value.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    const TEST_SANDBOX_SESSION_PATH: &str = "/odyssey-test/session";
+    const TEST_SANDBOX_WRITE_PATH: &str = "/odyssey-test/output";
+
+    #[test]
+    fn session_spec_defaults_sandbox_to_none() {
+        let spec = SessionSpec::from("local/demo@0.1.0");
+
+        assert!(spec.sandbox.is_none());
+        assert_eq!(spec.bundle_ref.as_str(), "local/demo@0.1.0");
+    }
+
+    #[test]
+    fn session_sandbox_overlay_round_trips() {
+        let overlay = SessionSandboxOverlay {
+            mode: Some(SandboxMode::WorkspaceWrite),
+            permissions: SessionSandboxPermissions {
+                filesystem: SessionSandboxFilesystem {
+                    exec: vec!["/opt/bin".to_string()],
+                    mounts: SessionSandboxMounts {
+                        read: vec![".".to_string()],
+                        write: vec![TEST_SANDBOX_SESSION_PATH.to_string()],
+                    },
+                },
+            },
+            env: BTreeMap::from([("API_TOKEN".to_string(), "ODYSSEY_TOKEN".to_string())]),
+            system_tools: vec!["git".to_string()],
+        };
+
+        let encoded = serde_json::to_value(&overlay).expect("serialize");
+        let decoded: SessionSandboxOverlay =
+            serde_json::from_value(encoded.clone()).expect("deserialize");
+
+        assert_eq!(
+            serde_json::to_value(decoded).expect("re-serialize"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn session_sandbox_overlay_merge_unions_and_overrides() {
+        let base = SessionSandboxOverlay {
+            mode: Some(SandboxMode::ReadOnly),
+            permissions: SessionSandboxPermissions {
+                filesystem: SessionSandboxFilesystem {
+                    exec: vec!["/usr/local/bin".to_string()],
+                    mounts: SessionSandboxMounts {
+                        read: vec!["/data".to_string()],
+                        write: Vec::new(),
+                    },
+                },
+            },
+            env: BTreeMap::from([("TOKEN".to_string(), "BASE_TOKEN".to_string())]),
+            system_tools: vec!["git".to_string()],
+        };
+        let overlay = SessionSandboxOverlay {
+            mode: Some(SandboxMode::WorkspaceWrite),
+            permissions: SessionSandboxPermissions {
+                filesystem: SessionSandboxFilesystem {
+                    exec: vec!["/opt/bin".to_string()],
+                    mounts: SessionSandboxMounts {
+                        read: vec!["/workspace".to_string()],
+                        write: vec![TEST_SANDBOX_WRITE_PATH.to_string()],
+                    },
+                },
+            },
+            env: BTreeMap::from([("TOKEN".to_string(), "OVERRIDE_TOKEN".to_string())]),
+            system_tools: vec!["python3".to_string()],
+        };
+
+        let merged = SessionSandboxOverlay::merge(Some(&base), Some(&overlay)).expect("merged");
+
+        assert_eq!(merged.mode, Some(SandboxMode::WorkspaceWrite));
+        assert_eq!(
+            merged.permissions.filesystem.exec,
+            vec!["/usr/local/bin".to_string(), "/opt/bin".to_string()]
+        );
+        assert_eq!(
+            merged.permissions.filesystem.mounts.read,
+            vec!["/data".to_string(), "/workspace".to_string()]
+        );
+        assert_eq!(
+            merged.permissions.filesystem.mounts.write,
+            vec![TEST_SANDBOX_WRITE_PATH.to_string()]
+        );
+        assert_eq!(merged.env.get("TOKEN"), Some(&"OVERRIDE_TOKEN".to_string()));
+        assert_eq!(
+            merged.system_tools,
+            vec!["git".to_string(), "python3".to_string()]
+        );
+    }
 
     #[test]
     fn turn_context_override() {

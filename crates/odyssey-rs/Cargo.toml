@@ -13,6 +13,11 @@ readme.workspace = true
 name = "odyssey-rs"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["odyssey-rs-runtime/cuda"]
+meta = ["odyssey-rs-runtime/meta"]
+
 [dependencies]
 odyssey-rs-manifest.workspace = true
 odyssey-rs-bundle.workspace = true

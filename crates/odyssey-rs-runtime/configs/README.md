@@ -36,21 +36,22 @@ odyssey-rs run {{ bundle_id }}@latest --prompt "Hey, What is your name?"
 
 ## Starter Template Defaults
 
-The generated `odyssey.bundle.json5` starts with a development-friendly policy:
+The generated `odyssey.bundle.yaml` starts with a development-friendly policy:
 
-- `executor.id: "react"`
-- `memory.id: "sliding_window"`
+- `execution.executor: "react/v1"`
+- `execution.memory: "session-window/v1"`
 - all builtin tools listed in `manifest.tools`
+- a bundle-local `.gitignore` to exclude common build output from portable bundle payloads
 - `sandbox.mode: "read_only"`
 - `sandbox.permissions.network: ["*"]`
 - `sandbox.system_tools_mode: "standard"`
 - `sandbox.system_tools: []`
 - `sandbox.env: {}`
 
-The generated `agent.yaml` starts with:
+The generated `agents/<bundle-id>/agent.yaml` starts with:
 
 - an OpenAI model entry using `gpt-4.1-mini`
-- empty `tools.allow`, `tools.ask`, and `tools.deny`
+- empty `tools.require`, `tools.allow`, `tools.ask`, and `tools.deny`
 
 Because those tool-rule lists are empty, the agent still has access to the tools declared by the
 manifest. Tighten both files before you treat the bundle as production automation.
@@ -61,15 +62,16 @@ manifest. Tighten both files before you treat the bundle as production automatio
   bundle tools such as `Bash`.
 - `sandbox.permissions.network: ["*"]` enables unrestricted outbound network access. Hostname
   allowlists are not implemented in v1.
-- `agent.yaml` owns tool permissions through `tools.allow`, `tools.ask`, and `tools.deny`.
+- `agents/<bundle-id>/agent.yaml` owns tool selection and permissions through `tools.require`,
+  `tools.allow`, `tools.ask`, and `tools.deny`.
 - Tool permission entries can be coarse like `Bash` or granular like `Bash(cargo test:*)` and
   `Bash(find:*)`.
 - Invalid tool permission entries are rejected instead of silently falling back to broad tool-name
   matching.
 - `sandbox.env` maps sandbox variable names to host environment variable names for sandboxed bundle
   commands. Missing host variables are skipped.
-- Model-provider credentials such as `OPENAI_API_KEY` are read by the Odyssey runtime process
-  itself, not from `sandbox.env`.
+- Model-provider credentials such as `OPENAI_API_KEY`, `HUGGINGFACE_TOKEN`, `HF_TOKEN`, and
+  `HUGGINGFACE_HUB_TOKEN` are read by the Odyssey runtime process itself, not from `sandbox.env`.
 - `sandbox.system_tools_mode` controls host executable policy for sandboxed process execution:
   `explicit`, `standard`, or `all`.
 - `sandbox.system_tools` lists additional named host binaries when `system_tools_mode` is

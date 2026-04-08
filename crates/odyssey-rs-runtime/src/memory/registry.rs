@@ -2,19 +2,19 @@ use crate::RuntimeError;
 use crate::session::{TurnChatMessageRecord, TurnRecord};
 use autoagents_core::agent::memory::{MemoryProvider, SlidingWindowMemory};
 use autoagents_llm::chat::{ChatMessage, ChatRole, MessageType};
-use odyssey_rs_manifest::BundleManifest;
+use odyssey_rs_manifest::AgentSpec;
 use serde_json::Value;
 
 const DEFAULT_SLIDING_WINDOW_SIZE: usize = 100;
 
 pub fn build_memory(
-    manifest: &BundleManifest,
+    agent: &AgentSpec,
     turns: &[TurnRecord],
 ) -> Result<Option<Box<dyn MemoryProvider>>, RuntimeError> {
-    match manifest.memory.id.as_str() {
-        "sliding_window" => {
+    match agent.execution.memory.as_str() {
+        "session-window/v1" | "sliding_window" => {
             let window =
-                window_size(&manifest.memory.config).unwrap_or(DEFAULT_SLIDING_WINDOW_SIZE);
+                window_size(&agent.execution.memory_config).unwrap_or(DEFAULT_SLIDING_WINDOW_SIZE);
             let mut memory = SlidingWindowMemory::new(window);
             let history = session_history(turns);
             let _ = memory.preload(history);
@@ -67,29 +67,15 @@ mod tests {
     use autoagents_llm::chat::{ChatRole, MessageType};
     use autoagents_llm::{FunctionCall, ToolCall};
     use chrono::Utc;
-    use odyssey_rs_manifest::{
-        BundleExecutor, BundleManifest, BundleMemory, BundleSandbox, ManifestVersion, ProviderKind,
-    };
+    use odyssey_rs_manifest::AgentSpec;
     use pretty_assertions::assert_eq;
-    use serde_json::Value;
 
     #[tokio::test]
     async fn build_memory_preloads_recent_session_history() {
-        let manifest = BundleManifest {
+        let agent = AgentSpec {
             id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
-            sandbox: BundleSandbox::default(),
+            name: "demo".to_string(),
+            ..AgentSpec::default()
         };
         let turns = vec![
             TurnRecord {
@@ -108,7 +94,7 @@ mod tests {
             },
         ];
 
-        let memory = build_memory(&manifest, &turns)
+        let memory = build_memory(&agent, &turns)
             .expect("memory")
             .expect("provider");
         let recalled = memory.recall("", None).await.expect("recall");
@@ -122,21 +108,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_memory_replays_tool_calls_from_chat_history() {
-        let manifest = BundleManifest {
+        let agent = AgentSpec {
             id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
-            sandbox: BundleSandbox::default(),
+            name: "demo".to_string(),
+            ..AgentSpec::default()
         };
         let turns = vec![TurnRecord {
             turn_id: uuid::Uuid::new_v4(),
@@ -173,7 +148,7 @@ mod tests {
             created_at: Utc::now(),
         }];
 
-        let memory = build_memory(&manifest, &turns)
+        let memory = build_memory(&agent, &turns)
             .expect("memory")
             .expect("provider");
         let recalled = memory.recall("", None).await.expect("recall");

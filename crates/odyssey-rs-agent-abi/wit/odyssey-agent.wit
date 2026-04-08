@@ -1,0 +1,23 @@
+package odyssey:agent@2.0.0;
+
+interface odyssey-host {
+  llm-chat: func(request-json: string) -> result<string, string>;
+  tool-call: func(request-json: string) -> result<string, string>;
+  emit-event: func(event-json: string) -> result<_, string>;
+}
+
+interface odyssey-agent {
+  record agent-descriptor {
+    id: string,
+    abi-version: string,
+    runner-class: string,
+  }
+
+  describe: func() -> agent-descriptor;
+  run: func(request-json: string) -> result<string, string>;
+}
+
+world odyssey-agent-world {
+  import odyssey-host;
+  export odyssey-agent;
+}

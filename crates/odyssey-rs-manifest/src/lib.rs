@@ -4,11 +4,15 @@ mod error;
 mod loader;
 mod reference;
 
-pub use agent_spec::{AgentSpec, AgentToolPolicy};
+pub use agent_spec::{
+    AgentExecution, AgentInterfaces, AgentKind, AgentPolicyHints, AgentProgram, AgentRequirements,
+    AgentSpec, AgentToolPolicy,
+};
 pub use bundle_manifest::{
-    BundleExecutor, BundleManifest, BundleMemory, BundleSandbox, BundleSandboxFilesystem,
-    BundleSandboxLimits, BundleSandboxMounts, BundleSandboxPermissions, BundleSkill,
-    BundleSystemToolsMode, BundleTool, ManifestVersion, ProviderKind,
+    BundleAgentEntry, BundleDescriptor, BundleExecutor, BundleManifest, BundleMemory,
+    BundleSandbox, BundleSandboxFilesystem, BundleSandboxLimits, BundleSandboxMounts,
+    BundleSandboxPermissions, BundleSignatures, BundleSkill, BundleSystemToolsMode, BundleTool,
+    ManifestVersion, ProviderKind,
 };
 pub use error::ManifestError;
 pub use loader::BundleLoader;

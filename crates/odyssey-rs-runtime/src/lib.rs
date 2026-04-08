@@ -15,4 +15,4 @@ pub use error::RuntimeError;
 
 pub use runtime::{OdysseyRuntime, RunOutput, SessionCommandOutput};
 pub type RuntimeEngine = OdysseyRuntime;
-pub use config::RuntimeConfig;
+pub use config::{AgentRuntimeConfig, BundleRuntimeConfig, RuntimeConfig, RuntimeConfigFile};

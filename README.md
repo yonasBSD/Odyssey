@@ -39,7 +39,7 @@ Odyssey currently uses prebuilt executors and prebuilt memory providers in v1. C
 
 - **Bundle-first delivery:** agents are packaged artifacts, not scattered app-local configuration.
 - **One runtime, many surfaces:** the SDK, CLI, HTTP server, and TUI all sit on the same runtime contract.
-- **Security by default:** sandbox mode, tool approvals, filesystem mounts, and network rules are part of the bundle definition.
+- **Security by default:** bundle manifests define the portable baseline, and user-level runtime config can layer bundle-scoped sandbox mounts, env passthrough, and model overrides on top.
 - **Operationally practical:** local install, export/import, and hub push/pull workflows are built in.
 - **Rust-native core:** explicit types, embeddable crates, and a runtime that can be used directly in applications.
 
@@ -71,7 +71,7 @@ Odyssey currently uses prebuilt executors and prebuilt memory providers in v1. C
 
 An Odyssey bundle is the unit of portability. A typical bundle contains:
 
-- `odyssey.bundle.json5` for runtime policy, tools, sandbox, executor, and memory configuration
+- `odyssey.bundle.yaml` for runtime policy, tools, sandbox, executor, and memory configuration
 - `agent.yaml` for agent identity, prompt, model, and tool policy
 - `skills/` for reusable prompt extensions
 - `resources/` for bundle-local assets
@@ -123,15 +123,15 @@ odyssey-rs init ./hello-world
 
 This creates a starter project with:
 
-- `odyssey.bundle.json5`
+- `odyssey.bundle.yaml`
 - `agent.yaml`
 - `README.md`
 - `skills/`
 - `resources/`
 
-The starter template currently uses the `react` executor, `sliding_window` memory, all builtin
-tools, and a development-friendly sandbox policy. Tighten the bundle manifest before production
-use.
+The starter template currently uses the `react/v1` executor, `session-window/v1` memory, all
+builtin tools, a bundle-local `.gitignore`, and a development-friendly sandbox policy. Tighten the
+bundle manifest before production use.
 
 ### 2. Build and install locally
 

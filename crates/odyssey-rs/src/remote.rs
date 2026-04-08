@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use odyssey_rs_protocol::{Session, SessionSummary, Task};
+use odyssey_rs_protocol::{Session, SessionSpec, SessionSummary, Task};
 use odyssey_rs_runtime::RunOutput;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -31,14 +31,7 @@ impl RemoteRuntimeClient {
     }
 
     pub(crate) async fn run(&self, bundle_ref: String, input: String) -> Result<RunOutput> {
-        let session: SessionSummary = self
-            .post(
-                "/sessions",
-                serde_json::json!({
-                    "bundle_ref": bundle_ref
-                }),
-            )
-            .await?;
+        let session = self.create_session(SessionSpec::from(bundle_ref)).await?;
         self.post(
             &format!("/sessions/{}/run-sync", session.id),
             serde_json::json!({
@@ -46,6 +39,10 @@ impl RemoteRuntimeClient {
             }),
         )
         .await
+    }
+
+    pub(crate) async fn create_session(&self, spec: SessionSpec) -> Result<SessionSummary> {
+        self.post("/sessions", serde_json::to_value(spec)?).await
     }
 
     pub(crate) async fn pull(

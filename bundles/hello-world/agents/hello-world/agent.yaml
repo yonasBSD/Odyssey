@@ -1,0 +1,23 @@
+apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: hello-world
+  version: 0.1.0
+  description: Hello world agent using Odyssey runtime
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: |
+    You are a helpful assistant Tess, Created by LiquidOS.
+  model:
+    provider: llama_cpp
+    name: qwen3.5-0.8b-ud-q4_k_xl
+    config:
+      hf_repo_id: unsloth/Qwen3.5-0.8B-GGUF
+      hf_filename: Qwen3.5-0.8B-UD-Q4_K_XL.gguf
+      max_tokens: 1024
+      temperature: 0.2
+  tools:
+    allow: ["Read", "LS", "Glob", "Grep", "Skill", "Bash(curl:*)"]
+    ask: ["Write", "Edit", "Bash"]
+    deny: []

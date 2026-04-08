@@ -34,8 +34,12 @@ pub async fn create_session(
     app.select_session(session_id);
     if let Some(agent_id) = agent_id {
         app.set_active_session(session_id, agent_id);
-    } else if let Ok(session) = client.get_session(session_id).await {
-        app.set_active_session(session.id, session.agent_id);
+    }
+    if let Ok(session) = client.get_session(session_id).await {
+        app.set_active_model(session.model_id.clone());
+        if app.active_agent.is_none() {
+            app.set_active_session(session.id, session.agent_id);
+        }
     }
     app.push_status("session created");
     spawn_stream(client.clone(), session_id, sender, stream_handle);
@@ -54,6 +58,7 @@ pub async fn join_session(
     refresh_sessions(client, app).await?;
     app.select_session(session_id);
     let session = client.get_session(session_id).await?;
+    app.set_active_model(session.model_id.clone());
     app.set_active_session(session.id, session.agent_id);
     app.load_messages(session.messages);
     app.push_status("session joined");
@@ -73,8 +78,9 @@ pub async fn activate_selected_session(
         let agent_id = session.agent_id;
         info!("activating session (session_id={})", session_id);
         app.select_session(session_id);
-        app.set_active_session(session_id, agent_id);
+        app.set_active_session(session_id, agent_id.clone());
         if let Ok(session_detail) = client.get_session(session_id).await {
+            app.set_active_model(session_detail.model_id.clone());
             app.load_messages(session_detail.messages);
         }
         app.push_status("session selected");

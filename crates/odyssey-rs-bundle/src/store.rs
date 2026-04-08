@@ -131,7 +131,7 @@ impl BundleStore {
     ) -> Result<BundleMetadata, BundleError> {
         let reference = BundleRef::parse(target);
         let source_path = Path::new(source);
-        let install = if source_path.is_dir() && source_path.join("odyssey.bundle.json5").exists() {
+        let install = if source_path.is_dir() && source_path.join("odyssey.bundle.yaml").exists() {
             let namespace = reference.namespace.clone().ok_or_else(|| {
                 BundleError::Invalid("publish target must include a namespace".to_string())
             })?;
@@ -329,7 +329,18 @@ impl BundleStore {
             digest: manifest_digest,
             readme: config.readme.clone(),
             bundle_manifest: config.bundle_manifest.clone(),
-            agent_spec: config.agent_spec.clone(),
+            agent_spec: config
+                .agents
+                .iter()
+                .find(|agent| {
+                    Some(agent.id.as_str()) == config.bundle_manifest.default_agent_entry_id()
+                })
+                .cloned()
+                .or_else(|| config.agents.first().cloned())
+                .ok_or_else(|| {
+                    BundleError::Invalid("bundle config does not contain any agents".to_string())
+                })?,
+            agents: config.agents.clone(),
         };
         self.persist_layout_blobs(layout_root)?;
         self.install_layout_payload(
@@ -394,7 +405,18 @@ impl BundleStore {
             digest: manifest_digest.clone(),
             readme: config.readme.clone(),
             bundle_manifest: config.bundle_manifest.clone(),
-            agent_spec: config.agent_spec.clone(),
+            agent_spec: config
+                .agents
+                .iter()
+                .find(|agent| {
+                    Some(agent.id.as_str()) == config.bundle_manifest.default_agent_entry_id()
+                })
+                .cloned()
+                .or_else(|| config.agents.first().cloned())
+                .ok_or_else(|| {
+                    BundleError::Invalid("bundle config does not contain any agents".to_string())
+                })?,
+            agents: config.agents.clone(),
         };
         if metadata_matches_config(&metadata, &expected_metadata) {
             return Ok(ValidatedRemoteLayout {
@@ -1106,8 +1128,9 @@ mod tests {
         assert_eq!(by_path.path, install.path);
         assert_eq!(by_digest.metadata.digest, install.metadata.digest);
         assert_eq!(
-            fs::read_to_string(install.path.join("agent.yaml")).expect("read agent"),
-            "id: demo\ndescription: test bundle\nprompt: keep responses concise\nmodel:\n  provider: openai\n  name: gpt-4.1-mini\ntools:\n  allow: [\"Read\", \"Skill\"]\n"
+            fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+                .expect("read agent"),
+            "apiVersion: odyssey.ai/v1\nkind: Agent\nmetadata:\n  name: demo\n  version: 0.1.0\n  description: test bundle\nspec:\n  kind: prompt\n  prompt: keep responses concise\n  model:\n    provider: openai\n    name: gpt-4.1-mini\n  tools:\n    allow: [\"Read\", \"Skill\"]\n"
         );
         assert_eq!(
             fs::read_to_string(
@@ -1433,7 +1456,12 @@ mod tests {
             .join("demo")
             .join("0.1.0");
         fs::create_dir_all(&install_root).expect("create install root");
-        fs::write(install_root.join("agent.yaml"), "old bundle").expect("write bundle");
+        fs::create_dir_all(install_root.join("agents").join("demo")).expect("create agent path");
+        fs::write(
+            install_root.join("agents").join("demo").join("agent.yaml"),
+            "old bundle",
+        )
+        .expect("write bundle");
 
         let missing_staged_root = temp.path().join("missing-staged-root");
         let error = commit_staged_install(&missing_staged_root, &install_root)
@@ -1444,7 +1472,8 @@ mod tests {
             BundleError::Io { path, .. } if path == install_root.display().to_string()
         ));
         assert_eq!(
-            fs::read_to_string(install_root.join("agent.yaml")).expect("read restored bundle"),
+            fs::read_to_string(install_root.join("agents").join("demo").join("agent.yaml"))
+                .expect("read restored bundle"),
             "old bundle"
         );
         assert!(
@@ -1614,7 +1643,8 @@ mod tests {
             .build_and_install(&project_root)
             .expect("build and install");
         let original_agent =
-            fs::read_to_string(install.path.join("agent.yaml")).expect("read original agent");
+            fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+                .expect("read original agent");
         let source_layout_root = install.path.join(".odyssey");
         let (_, manifest, _) = read_manifest(&source_layout_root).expect("read manifest");
         let config_digest = manifest.config.digest.clone();
@@ -1656,7 +1686,8 @@ mod tests {
             "invalid bundle: invalid bundle payload header"
         );
         assert_eq!(
-            fs::read_to_string(install.path.join("agent.yaml")).expect("read preserved agent"),
+            fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+                .expect("read preserved agent"),
             original_agent
         );
         assert_eq!(
@@ -1688,7 +1719,8 @@ mod tests {
             .build_and_install(&project_root)
             .expect("build and install");
         let original_agent =
-            fs::read_to_string(install.path.join("agent.yaml")).expect("read original agent");
+            fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+                .expect("read original agent");
         let layout_root = install.path.join(".odyssey");
         let (_, manifest, _) = read_manifest(&layout_root).expect("read manifest");
         let index_bytes = fs::read(layout_root.join("index.json")).expect("read index");
@@ -1707,7 +1739,8 @@ mod tests {
             "invalid bundle: invalid bundle payload header"
         );
         assert_eq!(
-            fs::read_to_string(install.path.join("agent.yaml")).expect("read preserved agent"),
+            fs::read_to_string(install.path.join("agents").join("demo").join("agent.yaml"))
+                .expect("read preserved agent"),
             original_agent
         );
         assert_eq!(

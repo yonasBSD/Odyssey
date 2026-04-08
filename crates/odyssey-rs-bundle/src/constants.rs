@@ -1,5 +1,8 @@
-//File Names
-pub(crate) const AGENT_SPEC_FILE_NAME: &str = "agent.yaml";
+// File Names
+pub(crate) const BUNDLE_MANIFEST_FILE_NAME: &str = "odyssey.bundle.yaml";
+pub(crate) const BUNDLE_GITIGNORE_FILE_NAME: &str = ".gitignore";
+pub(crate) const AGENTS_DIR_NAME: &str = "agents";
+pub(crate) const SHARED_DIR_NAME: &str = "shared";
 pub(crate) const SKILLS_DIR_NAME: &str = "skills";
 pub(crate) const RESOURCES_DIR_NAME: &str = "resources";
 

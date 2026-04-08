@@ -73,15 +73,19 @@ mod tests {
     use crate::client::AgentRuntimeClient;
     use crate::event::AppEvent;
     use chrono::Utc;
-    use odyssey_rs_protocol::{EventMsg, EventPayload, SandboxMode};
-    use odyssey_rs_runtime::{RuntimeConfig, RuntimeEngine};
+    use odyssey_rs_protocol::{DEFAULT_HUB_URL, EventMsg, EventPayload, SandboxMode};
+    use odyssey_rs_runtime::{
+        AgentRuntimeConfig, BundleRuntimeConfig, RuntimeConfig, RuntimeEngine,
+    };
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
+    use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
     fn runtime_config(root: &Path) -> RuntimeConfig {
@@ -91,9 +95,17 @@ mod tests {
             sandbox_root: root.join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: Some(SandboxMode::DangerFullAccess),
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn workspace_write_runtime_config(root: &Path) -> RuntimeConfig {
+        RuntimeConfig {
+            sandbox_mode_override: Some(SandboxMode::WorkspaceWrite),
+            ..runtime_config(root)
         }
     }
 
@@ -105,44 +117,63 @@ mod tests {
         skill_name: &str,
         skill_description: &str,
     ) {
+        let agent_root = root.join("agents").join(agent_id);
         fs::create_dir_all(root.join("skills").join(skill_name)).expect("create skill dir");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{bundle_id}",
-                    version: "0.1.0",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "{skill_name}", path: "skills/{skill_name}" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: []
-                        }},
-                        system_tools: [],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: {skill_name}
+      path: skills/{skill_name}
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network: []
+    system_tools: []
+    resources: {{}}
+  agents:
+    - id: {agent_id}
+      spec: agents/{agent_id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {agent_id}
-description: test bundle
-prompt: keep responses concise
-model:
-  provider: openai
-  name: {model_name}
-tools:
-  allow: ["Read", "Skill"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {agent_id}
+  version: 0.1.0
+  description: test bundle
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: {model_name}
+  tools:
+    allow: ["Read", "Skill"]
 "#
             ),
         )
@@ -241,7 +272,40 @@ tools:
     #[tokio::test]
     async fn bundle_and_session_handlers_install_switch_and_join() {
         let temp = tempdir().expect("tempdir");
-        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let mut config = runtime_config(temp.path());
+        config.bundle_overrides.insert(
+            "alpha@latest".to_string(),
+            BundleRuntimeConfig {
+                agents: BTreeMap::from([(
+                    "alpha-agent".to_string(),
+                    AgentRuntimeConfig {
+                        model: Some("gpt-5.4".to_string()),
+                        model_provider: Some("openai".to_string()),
+                        model_config: Some(serde_json::json!({
+                            "reasoning_effort": "high"
+                        })),
+                        sandbox: None,
+                    },
+                )]),
+            },
+        );
+        config.bundle_overrides.insert(
+            "beta@latest".to_string(),
+            BundleRuntimeConfig {
+                agents: BTreeMap::from([(
+                    "beta-agent".to_string(),
+                    AgentRuntimeConfig {
+                        model: Some("o3".to_string()),
+                        model_provider: Some("openai".to_string()),
+                        model_config: Some(serde_json::json!({
+                            "reasoning_effort": "medium"
+                        })),
+                        sandbox: None,
+                    },
+                )]),
+            },
+        );
+        let runtime = Arc::new(RuntimeEngine::new(config).expect("runtime"));
         let alpha_project = temp.path().join("alpha-project");
         let beta_project = temp.path().join("beta-project");
         fs::create_dir_all(&alpha_project).expect("create alpha project");
@@ -285,6 +349,7 @@ tools:
         .expect("install bundle");
         assert_eq!(app.bundle_ref, "local/alpha@0.1.0");
         assert_eq!(app.active_agent.as_deref(), Some("alpha-agent"));
+        assert_eq!(app.model_id, "gpt-5.4");
         assert!(app.active_session.is_some());
         assert_eq!(app.status, "bundle set: local/alpha@0.1.0");
         assert_eq!(app.skills.len(), 1);
@@ -306,6 +371,7 @@ tools:
             .expect("activate selected bundle");
         assert_eq!(app.bundle_ref, "local/beta@0.1.0");
         assert_eq!(app.active_agent.as_deref(), Some("beta-agent"));
+        assert_eq!(app.model_id, "o3");
         assert!(app.active_session.is_some());
         assert_eq!(app.status, "bundle set: local/beta@0.1.0");
 
@@ -323,6 +389,7 @@ tools:
         .await
         .expect("join session");
         assert_eq!(app.active_session, Some(joined_session_id));
+        assert_eq!(app.model_id, "o3");
         assert_eq!(app.status, "session joined");
 
         session::refresh_sessions(&client, &mut app)
@@ -337,6 +404,7 @@ tools:
             .await
             .expect("activate session");
         assert_eq!(app.active_session, Some(joined_session_id));
+        assert_eq!(app.model_id, "o3");
         assert_eq!(app.status, "session selected");
 
         let mut no_session_app = App {
@@ -503,5 +571,80 @@ tools:
         )
         .await
         .expect("handle tick");
+    }
+
+    #[tokio::test]
+    async fn session_send_message_does_not_forward_header_cwd_into_sandbox() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(
+            RuntimeEngine::new(workspace_write_runtime_config(temp.path())).expect("runtime"),
+        );
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(
+            &project,
+            "alpha",
+            "alpha-agent",
+            "gpt-4.1-mini",
+            "repo-hygiene",
+            "Keep commits focused.",
+        );
+        fs::write(
+            project
+                .join("agents")
+                .join("alpha-agent")
+                .join("agent.yaml"),
+            r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: alpha-agent
+  version: 0.1.0
+  description: test bundle
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+    config:
+      api_key: "   "
+  tools:
+    allow: ["Read", "Skill"]
+"#,
+        )
+        .expect("write agent");
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let client = Arc::new(AgentRuntimeClient::new(
+            runtime,
+            "local/alpha@0.1.0".to_string(),
+        ));
+        let session_id = client.create_session(None).await.expect("create session");
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut app = App {
+            active_session: Some(session_id),
+            active_agent: Some("alpha-agent".to_string()),
+            model_id: "gpt-4.1-mini".to_string(),
+            input: "hello".to_string(),
+            cwd: temp.path().join("host-only").display().to_string(),
+            ..App::default()
+        };
+
+        session::send_message(&client, &mut app, sender)
+            .await
+            .expect("send message");
+
+        let event = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("action error timeout")
+            .expect("action error event");
+        match event {
+            AppEvent::ActionError(message) => {
+                assert!(message.contains("provider openai requires non-empty config.api_key"));
+                assert!(!message.contains("working directory is not visible inside sandbox"));
+            }
+            other => panic!("unexpected app event: {other:?}"),
+        }
     }
 }

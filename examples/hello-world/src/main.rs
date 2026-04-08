@@ -1,4 +1,4 @@
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use odyssey_rs_protocol::{ExecutionRequest, SessionSpec, Task};
 use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
 use std::env;
@@ -9,11 +9,6 @@ const DEFAULT_PROMPT: &str = "Introduce yourself in one sentence and say that th
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    ensure!(
-        env::var_os("OPENAI_API_KEY").is_some(),
-        "set OPENAI_API_KEY before running this example"
-    );
-
     let prompt = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_PROMPT.to_string());

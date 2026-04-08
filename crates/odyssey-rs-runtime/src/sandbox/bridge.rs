@@ -1,6 +1,6 @@
 use crate::RuntimeError;
 use odyssey_rs_manifest::{AgentSpec, BundleManifest, BundleSystemToolsMode};
-use odyssey_rs_protocol::SandboxMode;
+use odyssey_rs_protocol::{SandboxMode, SessionSandboxOverlay};
 use odyssey_rs_sandbox::{
     SandboxCellKey, SandboxCellSpec, SandboxLimits, SandboxMountBinding, SandboxNetworkMode,
     SandboxNetworkPolicy, SandboxPolicy, SandboxRuntime, standard_system_exec_roots,
@@ -36,13 +36,23 @@ struct CellPreparationRequest<'a> {
     agent_id: &'a str,
     bundle_root: &'a Path,
     manifest: &'a BundleManifest,
+    session_overlay: Option<&'a SessionSandboxOverlay>,
     override_mode: Option<SandboxMode>,
     component_id: &'static str,
 }
 
+#[cfg(test)]
 pub fn build_policy(
     bundle_root: &Path,
     manifest: &BundleManifest,
+) -> Result<SandboxPolicy, RuntimeError> {
+    build_policy_with_overlay(bundle_root, manifest, None)
+}
+
+pub fn build_policy_with_overlay(
+    bundle_root: &Path,
+    manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
 ) -> Result<SandboxPolicy, RuntimeError> {
     let current_dir = std::env::current_dir().map_err(|err| RuntimeError::Io {
         path: ".".to_string(),
@@ -51,6 +61,7 @@ pub fn build_policy(
     build_policy_with_resolvers(
         bundle_root,
         manifest,
+        session_overlay,
         &[],
         false,
         read_process_env,
@@ -58,9 +69,18 @@ pub fn build_policy(
     )
 }
 
+#[cfg(test)]
 pub fn build_operator_command_policy(
     bundle_root: &Path,
     manifest: &BundleManifest,
+) -> Result<SandboxPolicy, RuntimeError> {
+    build_operator_command_policy_with_overlay(bundle_root, manifest, None)
+}
+
+pub fn build_operator_command_policy_with_overlay(
+    bundle_root: &Path,
+    manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
 ) -> Result<SandboxPolicy, RuntimeError> {
     let current_dir = std::env::current_dir().map_err(|err| RuntimeError::Io {
         path: ".".to_string(),
@@ -69,6 +89,7 @@ pub fn build_operator_command_policy(
     build_policy_with_resolvers(
         bundle_root,
         manifest,
+        session_overlay,
         &[],
         true,
         read_process_env,
@@ -79,6 +100,7 @@ pub fn build_operator_command_policy(
 fn build_policy_with_resolvers<F>(
     bundle_root: &Path,
     manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
     extra_exec_roots: &[String],
     force_standard_exec_roots: bool,
     env_resolver: F,
@@ -87,31 +109,38 @@ fn build_policy_with_resolvers<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
+    let overlay_read_mounts = session_overlay.map_or(&[][..], |overlay| {
+        overlay.permissions.filesystem.mounts.read.as_slice()
+    });
+    let overlay_write_mounts = session_overlay.map_or(&[][..], |overlay| {
+        overlay.permissions.filesystem.mounts.write.as_slice()
+    });
     let map_bundle_paths = |entries: &[String]| -> Result<Vec<String>, RuntimeError> {
         entries
             .iter()
             .map(|entry| resolve_bundle_exec_root(bundle_root, entry))
             .collect()
     };
-    let read_mounts = build_mount_bindings(
-        bundle_root,
-        current_dir,
-        &manifest.sandbox.permissions.filesystem.mounts.read,
-        false,
-    );
-    let write_mounts = build_mount_bindings(
-        bundle_root,
-        current_dir,
-        &manifest.sandbox.permissions.filesystem.mounts.write,
-        true,
-    );
+    let mut read_mount_values = manifest.sandbox.permissions.filesystem.mounts.read.clone();
+    read_mount_values.extend(overlay_read_mounts.iter().cloned());
+    let read_mounts = build_mount_bindings(bundle_root, current_dir, &read_mount_values, false);
+    let mut write_mount_values = manifest.sandbox.permissions.filesystem.mounts.write.clone();
+    write_mount_values.extend(overlay_write_mounts.iter().cloned());
+    let write_mounts = build_mount_bindings(bundle_root, current_dir, &write_mount_values, true);
     let mount_bindings = read_mounts
         .iter()
         .chain(&write_mounts)
         .cloned()
         .collect::<Vec<_>>();
-    let explicit_system_tools = resolve_system_tools(&manifest.sandbox.system_tools)?;
+    let mut explicit_system_tools_values = manifest.sandbox.system_tools.clone();
+    if let Some(overlay) = session_overlay {
+        explicit_system_tools_values.extend(overlay.system_tools.iter().cloned());
+    }
+    let explicit_system_tools = resolve_system_tools(&explicit_system_tools_values)?;
     let mut exec_roots = map_bundle_paths(&manifest.sandbox.permissions.filesystem.exec)?;
+    if let Some(overlay) = session_overlay {
+        exec_roots.extend(overlay.permissions.filesystem.exec.iter().cloned());
+    }
     exec_roots.extend(explicit_system_tools);
     let mut exec_allow_all = false;
     match manifest.sandbox.system_tools_mode {
@@ -154,7 +183,7 @@ where
         },
         env: odyssey_rs_sandbox::SandboxEnvPolicy {
             inherit: Vec::new(),
-            set: resolve_manifest_env(&manifest.sandbox.env, env_resolver),
+            set: resolve_manifest_env(&manifest.sandbox.env, session_overlay, env_resolver),
         },
         network: build_network_policy(&manifest.sandbox.permissions.network)?,
         limits: SandboxLimits {
@@ -191,11 +220,21 @@ fn build_mount_bindings(
 
 fn resolve_manifest_env(
     env: &std::collections::BTreeMap<String, String>,
+    session_overlay: Option<&SessionSandboxOverlay>,
     mut env_resolver: impl FnMut(&str) -> Option<String>,
 ) -> std::collections::BTreeMap<String, String> {
-    env.iter()
+    let mut resolved = env
+        .iter()
         .filter_map(|(target, source)| env_resolver(source).map(|value| (target.clone(), value)))
-        .collect()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if let Some(overlay) = session_overlay {
+        for (target, source) in &overlay.env {
+            if let Some(value) = env_resolver(source) {
+                resolved.insert(target.clone(), value);
+            }
+        }
+    }
+    resolved
 }
 
 fn read_process_env(name: &str) -> Option<String> {
@@ -215,8 +254,14 @@ fn is_current_directory_mount(value: &str) -> bool {
         && components.all(|component| component == std::path::Component::CurDir)
 }
 
-pub fn build_mode(manifest: &BundleManifest, override_mode: Option<SandboxMode>) -> SandboxMode {
-    override_mode.unwrap_or(manifest.sandbox.mode)
+pub fn build_mode(
+    manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
+    override_mode: Option<SandboxMode>,
+) -> SandboxMode {
+    override_mode
+        .or_else(|| session_overlay.and_then(|overlay| overlay.mode))
+        .unwrap_or(manifest.sandbox.mode)
 }
 
 pub fn build_permission_rules(agent: &AgentSpec) -> Result<Vec<ToolPermissionRule>, RuntimeError> {
@@ -250,6 +295,7 @@ pub async fn prepare_cell(
     agent_id: &str,
     bundle_root: &Path,
     manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
     override_mode: Option<SandboxMode>,
 ) -> Result<PreparedToolSandbox, RuntimeError> {
     prepare_cell_with_policy(
@@ -259,10 +305,11 @@ pub async fn prepare_cell(
             agent_id,
             bundle_root,
             manifest,
+            session_overlay,
             override_mode,
             component_id: AGENT_EXECUTION_COMPONENT,
         },
-        build_policy,
+        build_policy_with_overlay,
     )
     .await
 }
@@ -273,6 +320,7 @@ pub async fn prepare_operator_command_cell(
     agent_id: &str,
     bundle_root: &Path,
     manifest: &BundleManifest,
+    session_overlay: Option<&SessionSandboxOverlay>,
     override_mode: Option<SandboxMode>,
 ) -> Result<PreparedToolSandbox, RuntimeError> {
     prepare_cell_with_policy(
@@ -282,10 +330,11 @@ pub async fn prepare_operator_command_cell(
             agent_id,
             bundle_root,
             manifest,
+            session_overlay,
             override_mode,
             component_id: SESSION_COMMAND_COMPONENT,
         },
-        build_operator_command_policy,
+        build_operator_command_policy_with_overlay,
     )
     .await
 }
@@ -293,9 +342,17 @@ pub async fn prepare_operator_command_cell(
 async fn prepare_cell_with_policy(
     sandbox: &SandboxRuntime,
     request: CellPreparationRequest<'_>,
-    policy_builder: fn(&Path, &BundleManifest) -> Result<SandboxPolicy, RuntimeError>,
+    policy_builder: fn(
+        &Path,
+        &BundleManifest,
+        Option<&SessionSandboxOverlay>,
+    ) -> Result<SandboxPolicy, RuntimeError>,
 ) -> Result<PreparedToolSandbox, RuntimeError> {
-    let mode = build_mode(request.manifest, request.override_mode);
+    let mode = build_mode(
+        request.manifest,
+        request.session_overlay,
+        request.override_mode,
+    );
     let workspace_key = SandboxCellKey::tooling(request.session_id, request.agent_id);
     let key = SandboxCellKey::tooling_component(
         request.session_id,
@@ -304,7 +361,7 @@ async fn prepare_cell_with_policy(
     );
     let cell_root = sandbox.managed_cell_root(&workspace_key)?;
     let root = cell_root.join("app");
-    let policy = policy_builder(&root, request.manifest)?;
+    let policy = policy_builder(&root, request.manifest, request.session_overlay)?;
     validate_provider_support(sandbox.provider_name(), mode, &policy)?;
     stage_bundle_if_needed(request.bundle_root, &root, mode)?;
     validate_staged_bundle_exec_roots(
@@ -769,7 +826,8 @@ mod tests {
     use odyssey_rs_manifest::{
         AgentSpec, AgentToolPolicy, BundleExecutor, BundleManifest, BundleMemory, BundleSandbox,
         BundleSandboxFilesystem, BundleSandboxLimits, BundleSandboxMounts,
-        BundleSandboxPermissions, BundleSystemToolsMode, ManifestVersion, ProviderKind,
+        BundleSandboxPermissions, BundleSignatures, BundleSystemToolsMode, ManifestVersion,
+        ProviderKind,
     };
     use odyssey_rs_protocol::SandboxMode;
     use odyssey_rs_sandbox::{
@@ -784,22 +842,49 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    #[test]
-    fn build_policy_includes_host_mounts() {
-        let manifest = BundleManifest {
+    fn test_manifest() -> BundleManifest {
+        BundleManifest {
+            api_version: "odyssey.ai/bundle.v1".to_string(),
+            kind: "AgentBundle".to_string(),
             id: "demo".to_string(),
             version: "0.1.0".to_string(),
             manifest_version: ManifestVersion::V1,
+            abi_version: "v1".to_string(),
             readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
+            agent_spec: "agents/demo/agent.yaml".to_string(),
             executor: BundleExecutor {
                 kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
+                id: "react/v1".to_string(),
                 config: Value::Null,
             },
             memory: BundleMemory::default(),
             skills: Vec::new(),
             tools: Vec::new(),
+            sandbox: BundleSandbox::default(),
+            signatures: BundleSignatures::default(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn test_agent(policy: AgentToolPolicy) -> AgentSpec {
+        AgentSpec {
+            id: "demo".to_string(),
+            name: "demo".to_string(),
+            description: String::default(),
+            prompt: "test".to_string(),
+            model: odyssey_rs_protocol::ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-4.1-mini".to_string(),
+                config: None,
+            },
+            tools: policy,
+            ..AgentSpec::default()
+        }
+    }
+
+    #[test]
+    fn build_policy_includes_host_mounts() {
+        let manifest = BundleManifest {
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions {
@@ -817,6 +902,7 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy = build_policy(Path::new("/bundle"), &manifest).expect("build policy");
@@ -856,19 +942,6 @@ mod tests {
     fn build_policy_resolves_current_directory_mounts() {
         let temp = tempdir().expect("tempdir");
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions {
@@ -886,11 +959,13 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy = build_policy_with_resolvers(
             Path::new("/bundle"),
             &manifest,
+            None,
             &[],
             false,
             |_| None,
@@ -978,19 +1053,6 @@ mod tests {
     #[test]
     fn build_mode_prefers_runtime_override() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions::default(),
@@ -999,11 +1061,12 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
-        assert_eq!(build_mode(&manifest, None), SandboxMode::ReadOnly);
+        assert_eq!(build_mode(&manifest, None, None), SandboxMode::ReadOnly);
         assert_eq!(
-            build_mode(&manifest, Some(SandboxMode::DangerFullAccess)),
+            build_mode(&manifest, None, Some(SandboxMode::DangerFullAccess)),
             SandboxMode::DangerFullAccess
         );
     }
@@ -1038,19 +1101,6 @@ mod tests {
     #[test]
     fn build_policy_rejects_unsafe_exec_entries() {
         let mut manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::WorkspaceWrite,
                 permissions: BundleSandboxPermissions {
@@ -1065,6 +1115,7 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let traversal = build_policy(Path::new("/bundle-root"), &manifest)
@@ -1095,27 +1146,14 @@ mod tests {
         )
         .expect("sandbox runtime");
         let bundle_root = temp.path().join("bundle");
-        std::fs::create_dir_all(&bundle_root).expect("bundle root");
+        std::fs::create_dir_all(bundle_root.join("agents").join("demo")).expect("bundle root");
         std::fs::write(
-            bundle_root.join("agent.yaml"),
-            "id: demo\nprompt: hi\nmodel:\n  provider: openai\n  name: gpt-4.1-mini\n",
+            bundle_root.join("agents").join("demo").join("agent.yaml"),
+            "apiVersion: odyssey.ai/v1\nkind: Agent\nmetadata:\n  name: demo\n  version: 0.1.0\nspec:\n  kind: prompt\n  abiVersion: v1\n  prompt: hi\n  model:\n    provider: openai\n    name: gpt-4.1-mini\n",
         )
         .expect("agent");
 
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::DangerFullAccess,
                 permissions: BundleSandboxPermissions {
@@ -1127,18 +1165,28 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let session_id = Uuid::new_v4();
-        let agent = prepare_cell(&sandbox, session_id, "demo", &bundle_root, &manifest, None)
-            .await
-            .expect("agent cell");
+        let agent = prepare_cell(
+            &sandbox,
+            session_id,
+            "demo",
+            &bundle_root,
+            &manifest,
+            None,
+            None,
+        )
+        .await
+        .expect("agent cell");
         let command = prepare_operator_command_cell(
             &sandbox,
             session_id,
             "demo",
             &bundle_root,
             &manifest,
+            None,
             None,
         )
         .await
@@ -1160,19 +1208,6 @@ mod tests {
     #[test]
     fn build_policy_maps_exec_roots_and_resource_limits() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::WorkspaceWrite,
                 permissions: BundleSandboxPermissions {
@@ -1190,6 +1225,7 @@ mod tests {
                     memory_mb: Some(64),
                 },
             },
+            ..test_manifest()
         };
 
         let policy = build_policy(Path::new("/bundle-root"), &manifest).expect("build policy");
@@ -1218,19 +1254,6 @@ mod tests {
     #[test]
     fn build_policy_maps_manifest_env_into_sandbox_policy() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::WorkspaceWrite,
                 permissions: BundleSandboxPermissions::default(),
@@ -1242,11 +1265,13 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy = build_policy_with_resolvers(
             Path::new("/bundle-root"),
             &manifest,
+            None,
             &[],
             false,
             |name| match name {
@@ -1271,19 +1296,6 @@ mod tests {
     #[test]
     fn operator_command_policy_includes_standard_system_exec_roots() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions::default(),
@@ -1292,6 +1304,7 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy =
@@ -1322,24 +1335,15 @@ mod tests {
 
     #[test]
     fn build_permission_rules_maps_agent_actions() {
-        let agent = AgentSpec {
-            id: "demo".to_string(),
-            description: String::default(),
-            prompt: "test".to_string(),
-            model: odyssey_rs_protocol::ModelSpec {
-                provider: "openai".to_string(),
-                name: "gpt-4.1-mini".to_string(),
-                config: None,
-            },
-            tools: AgentToolPolicy {
-                allow: vec!["read".to_string(), "Bash(find:*)".to_string()],
-                ask: vec!["bash".to_string(), "Bash(cargo test:*)".to_string()],
-                deny: vec![
-                    "write".to_string(),
-                    "WebFetch(domain:liquidos.ai)".to_string(),
-                ],
-            },
-        };
+        let agent = test_agent(AgentToolPolicy {
+            require: Vec::new(),
+            allow: vec!["read".to_string(), "Bash(find:*)".to_string()],
+            ask: vec!["bash".to_string(), "Bash(cargo test:*)".to_string()],
+            deny: vec![
+                "write".to_string(),
+                "WebFetch(domain:liquidos.ai)".to_string(),
+            ],
+        });
 
         let rules = build_permission_rules(&agent).expect("rules");
 
@@ -1378,21 +1382,12 @@ mod tests {
 
     #[test]
     fn build_permission_rules_rejects_invalid_matchers() {
-        let agent = AgentSpec {
-            id: "demo".to_string(),
-            description: String::default(),
-            prompt: "test".to_string(),
-            model: odyssey_rs_protocol::ModelSpec {
-                provider: "openai".to_string(),
-                name: "gpt-4.1-mini".to_string(),
-                config: None,
-            },
-            tools: AgentToolPolicy {
-                allow: vec!["Bash(".to_string()],
-                ask: Vec::new(),
-                deny: Vec::new(),
-            },
-        };
+        let agent = test_agent(AgentToolPolicy {
+            require: Vec::new(),
+            allow: vec!["Bash(".to_string()],
+            ask: Vec::new(),
+            deny: Vec::new(),
+        });
 
         let error = build_permission_rules(&agent).expect_err("invalid matcher rejected");
         assert!(error.to_string().contains("invalid tool permission rule"));
@@ -1410,19 +1405,6 @@ mod tests {
     #[test]
     fn build_policy_adds_standard_exec_roots_when_requested() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions::default(),
@@ -1431,6 +1413,7 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy = build_policy(Path::new("/bundle-root"), &manifest).expect("build policy");
@@ -1447,19 +1430,6 @@ mod tests {
     #[test]
     fn build_policy_allows_all_exec_paths_when_requested() {
         let manifest = BundleManifest {
-            id: "demo".to_string(),
-            version: "0.1.0".to_string(),
-            manifest_version: ManifestVersion::V1,
-            readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
-            executor: BundleExecutor {
-                kind: ProviderKind::Prebuilt,
-                id: "react".to_string(),
-                config: Value::Null,
-            },
-            memory: BundleMemory::default(),
-            skills: Vec::new(),
-            tools: Vec::new(),
             sandbox: BundleSandbox {
                 mode: SandboxMode::ReadOnly,
                 permissions: BundleSandboxPermissions::default(),
@@ -1468,6 +1438,7 @@ mod tests {
                 system_tools: Vec::new(),
                 resources: BundleSandboxLimits::default(),
             },
+            ..test_manifest()
         };
 
         let policy = build_policy(Path::new("/bundle-root"), &manifest).expect("build policy");

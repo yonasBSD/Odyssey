@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/odyssey-rs",
+    "crates/odyssey-rs-agent-abi",
+    "crates/odyssey-rs-agent-sdk",
     "crates/odyssey-rs-manifest",
     "crates/odyssey-rs-bundle",
     "crates/odyssey-rs-protocol",
@@ -11,6 +13,7 @@ members = [
     "crates/odyssey-rs-server",
     "crates/odyssey-rs-tui",
     "examples/*",
+    "bundles/odyssey-agent/agents/odyssey-agent"
 ]
 
 default-members = ["crates/odyssey-rs"]
@@ -27,6 +30,8 @@ readme = "README.md"
 
 [workspace.dependencies]
 odyssey-rs = { path = "crates/odyssey-rs", version = "0.1.1" }
+odyssey-rs-agent-abi = { path = "crates/odyssey-rs-agent-abi", version = "0.1.1" }
+odyssey-rs-agent-sdk = { path = "crates/odyssey-rs-agent-sdk", version = "0.1.1" }
 odyssey-rs-manifest = { path = "crates/odyssey-rs-manifest", version = "0.1.1" }
 odyssey-rs-bundle = { path = "crates/odyssey-rs-bundle", version = "0.1.1" }
 odyssey-rs-protocol = { path = "crates/odyssey-rs-protocol", version = "0.1.1" }
@@ -36,9 +41,12 @@ odyssey-rs-sandbox = { path = "crates/odyssey-rs-sandbox", version = "0.1.1" }
 odyssey-rs-server = { path = "crates/odyssey-rs-server", version = "0.1.1" }
 odyssey-rs-tui = { path = "crates/odyssey-rs-tui", version = "0.1.1" }
 
-autoagents-core = { version = "0.3.6" }
-autoagents-llm = { version = "0.3.6" }
-autoagents-protocol = { version = "0.3.6" }
+autoagents = { git = "https://github.com/liquidos-ai/AutoAgents" }
+autoagents-core = { git = "https://github.com/liquidos-ai/AutoAgents" }
+autoagents-derive = { git = "https://github.com/liquidos-ai/AutoAgents" }
+autoagents-llm = { git = "https://github.com/liquidos-ai/AutoAgents" }
+autoagents-protocol = { git = "https://github.com/liquidos-ai/AutoAgents" }
+autoagents-llamacpp =  { git = "https://github.com/liquidos-ai/AutoAgents" }
 
 anyhow = "1.0.102"
 async-trait = "0.1.89"
@@ -47,9 +55,9 @@ chrono = { version = "0.4.44", features = ["serde", "clock"] }
 clap = { version = "4.6.0", features = ["derive"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
+futures = "0.3.32"
 futures-util = "0.3.32"
 hex = "0.4.3"
-json5 = "1.3.1"
 log = "0.4.29"
 parking_lot = "0.12.5"
 pulldown-cmark = "0.13.1"
@@ -72,6 +80,9 @@ tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 walkdir = "2.5.0"
 which = "8.0.2"
+wasmtime = "42.0.1"
+wasmtime-wasi = "42.0.1"
+wasmparser = "0.245.1"
 env_logger = "0.11.9"
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"

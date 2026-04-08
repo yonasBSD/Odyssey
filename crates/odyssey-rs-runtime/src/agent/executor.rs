@@ -1,9 +1,11 @@
-use super::OdysseyAgent;
 use crate::RuntimeError;
 use autoagents_core::agent::prebuilt::executor::ReActAgent;
-use autoagents_core::agent::{AgentBuilder, DirectAgent, task::Task};
-use autoagents_core::tool::ToolT;
+use autoagents_core::agent::{
+    AgentBuilder, AgentDeriveT, AgentHooks, Context, DirectAgent, HookOutcome, task::Task,
+};
+use autoagents_core::tool::{ToolCallResult, ToolT, shared_tools_to_boxes};
 use autoagents_llm::LLMProvider;
+use autoagents_llm::ToolCall;
 use chrono::Utc;
 use futures_util::StreamExt;
 use log::info;
@@ -30,7 +32,7 @@ pub struct ExecutorRun {
 
 pub async fn run_executor(run: ExecutorRun) -> Result<String, RuntimeError> {
     match run.executor_id.as_str() {
-        "react" => run_react(run).await,
+        "react" | "react/v1" => run_react(run).await,
         other => Err(RuntimeError::Unsupported(format!(
             "unsupported prebuilt executor: {other}"
         ))),
@@ -69,16 +71,19 @@ async fn run_react(run: ExecutorRun) -> Result<String, RuntimeError> {
         }
     };
     let mut response = String::default();
-    tokio::pin!(stream);
-    while let Some(output) = stream.next().await {
-        match output {
-            Ok(output) => response = output,
-            Err(err) => {
-                event_task.abort();
-                return Err(RuntimeError::Executor(err.to_string()));
+    {
+        tokio::pin!(stream);
+        while let Some(output) = stream.next().await {
+            match output {
+                Ok(output) => response = output,
+                Err(err) => {
+                    event_task.abort();
+                    return Err(RuntimeError::Executor(err.to_string()));
+                }
             }
         }
     }
+    drop(handle);
     match event_task.await {
         Ok(()) => {}
         Err(err) => {
@@ -118,12 +123,12 @@ async fn forward_autoagents_events(
     }
 }
 
-struct MappedEvent {
-    payloads: Vec<EventPayload>,
+pub(crate) struct MappedEvent {
+    pub(crate) payloads: Vec<EventPayload>,
     terminal: bool,
 }
 
-struct AutoagentsEventBridge {
+pub(crate) struct AutoagentsEventBridge {
     turn_id: Uuid,
     turn_context: TurnContext,
     reasoning_open: bool,
@@ -133,7 +138,7 @@ struct AutoagentsEventBridge {
 }
 
 impl AutoagentsEventBridge {
-    fn new(turn_id: Uuid, turn_context: TurnContext) -> Self {
+    pub(crate) fn new(turn_id: Uuid, turn_context: TurnContext) -> Self {
         Self {
             turn_id,
             turn_context,
@@ -144,7 +149,7 @@ impl AutoagentsEventBridge {
         }
     }
 
-    fn map_event(&mut self, event: AutoAgentsEvent) -> MappedEvent {
+    pub(crate) fn map_event(&mut self, event: AutoAgentsEvent) -> MappedEvent {
         match event {
             AutoAgentsEvent::TurnStarted { .. } => MappedEvent {
                 payloads: vec![EventPayload::TurnStarted {
@@ -344,6 +349,63 @@ impl AutoagentsEventBridge {
             .entry(raw_tool_call_id.to_string())
             .or_insert_with(Uuid::new_v4)
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct OdysseyAgent {
+    system_prompt: String,
+    tools: Vec<Arc<dyn ToolT>>,
+}
+
+impl OdysseyAgent {
+    fn new(system_prompt: String, tools: Vec<Arc<dyn ToolT>>) -> Self {
+        Self {
+            system_prompt,
+            tools,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentDeriveT for OdysseyAgent {
+    type Output = String;
+
+    fn description(&self) -> &str {
+        &self.system_prompt
+    }
+
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
+    fn name(&self) -> &str {
+        "odyssey-agent"
+    }
+
+    fn tools(&self) -> Vec<Box<dyn ToolT>> {
+        shared_tools_to_boxes(&self.tools)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentHooks for OdysseyAgent {
+    async fn on_run_start(&self, _task: &Task, _ctx: &Context) -> HookOutcome {
+        HookOutcome::Continue
+    }
+
+    async fn on_tool_call(&self, _tool_call: &ToolCall, _ctx: &Context) -> HookOutcome {
+        HookOutcome::Continue
+    }
+
+    async fn on_tool_result(
+        &self,
+        _tool_call: &ToolCall,
+        _result: &ToolCallResult,
+        _ctx: &Context,
+    ) {
+    }
+
+    async fn on_tool_error(&self, _tool_call: &ToolCall, _err: Value, _ctx: &Context) {}
 }
 
 fn parse_json_value(value: &str) -> Value {

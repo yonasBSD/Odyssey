@@ -1,4 +1,4 @@
-use odyssey_rs_protocol::{ModelSpec, Task, TurnContextOverride};
+use odyssey_rs_protocol::{ModelSpec, SessionSandboxOverlay, Task, TurnContextOverride};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,7 +11,11 @@ pub struct BuildRequest {
 pub struct CreateSessionRequest {
     pub bundle_ref: String,
     #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
     pub model: Option<ModelSpec>,
+    #[serde(default)]
+    pub sandbox: Option<SessionSandboxOverlay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +114,9 @@ mod tests {
 
         assert_eq!(build.project_path, "/workspace/project");
         assert_eq!(create.bundle_ref, "demo@0.1.0");
+        assert!(create.agent_id.is_none());
         assert!(create.model.is_none());
+        assert!(create.sandbox.is_none());
         assert!(run.turn_context.is_none());
         assert_eq!(run.input.prompt, "hello");
         assert_eq!(run.input.system_prompt, None);

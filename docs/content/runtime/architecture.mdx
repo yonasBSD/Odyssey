@@ -1,228 +1,103 @@
 ---
 title: Runtime Architecture
 slug: /architecture
-description: Architectural overview of scheduling, state, and transport surfaces in Odyssey.
+description: WASM-first runtime architecture for Odyssey.
 ---
 
 ## High-Level Shape
 
-Odyssey is a single-process runtime with three main layers:
+Odyssey now has four architectural layers:
 
 ```text
-CLI / TUI / HTTP server / embedded Rust app
-                  |
-             OdysseyRuntime
-                  |
-  -------------------------------------------------
-  BundleStore  SessionStore  Scheduler  ApprovalStore
-  ToolRegistry  host SandboxRuntime  restricted SandboxRuntime
+CLI / TUI / HTTP / embedded app
+            |
+       OdysseyRuntime
+            |
+  ---------------------------------------------
+  BundleStore  SessionStore  Scheduler  Tools
+  Models  Memory  Approvals  Sandbox runtimes
+            |
+   Native executors     WASM component host
+            |                  |
+  AutoAgents react/v1     Rust agent module.wasm
 ```
 
-The transport surface changes, but the execution engine does not. That is the most important design
-idea in the repository: the CLI, server, and TUI all drive the same runtime type.
+The key split is:
 
-## Core Runtime Components
+- Odyssey owns execution, persistence, tools, memory, policy, and orchestration.
+- AutoAgents remains the internal Rust execution engine.
+- The WASM agent module is a behavior module that steers the next step through the runner bridge.
 
-### Bundle store
+## Execution Path
 
-`BundleStore` owns bundle installation, lookup, export, import, publish, and pull flows. At
-execution time it resolves a bundle reference into an installed bundle path plus metadata and the
-resolved manifest.
+For a `kind: wasm` agent run, Odyssey executes the following flow:
 
-### Session store
+1. Resolve `bundle_ref + agent_id`.
+2. Build the session history view from prior turns.
+3. Select tools allowed for the agent.
+4. Build the real host-side `autoagents-llm` provider with Odyssey model resolution.
+5. Instantiate the WASM agent component in Wasmtime.
+6. Call the component `run` entrypoint once with the prompt, system prompt, history, metadata payload, and resolved host tool catalog.
+7. Serve component model calls through Odyssey host bindings backed by the host-built provider.
+8. Serve component tool calls through Odyssey brokers, approvals, and sandbox policy.
+9. Forward component AutoAgents events back into Odyssey's CLI/TUI/HTTP event stream.
+10. Persist the completed turn into session history.
 
-`SessionStore` persists sessions as JSON under the configured session root. It also owns the
-broadcast senders used for per-session event streams.
+The runtime still returns a normal Odyssey response and event stream to CLI, TUI, and HTTP callers.
 
-The store is designed for runtime continuity:
+## Why AutoAgents Stays Inside
 
-- session writes are atomic
-- corrupt session files are quarantined instead of crashing startup
-- turn history is normalized after execution so tool activity can be replayed into memory
+Odyssey is not replacing AutoAgents. It is hosting it in two places:
 
-### Tool registry
+AutoAgents still provides:
 
-The builtin `ToolRegistry` is process-wide. Each turn selects a subset of those tools based on the
-bundle manifest and the agent permission rules, then adapts them into the executor interface.
+- the ReAct loop
+- model/tool execution choreography
+- stream/event plumbing
+- memory integration points
 
-### Approval store
+Odyssey adds:
 
-`ApprovalStore` is in-memory session state for:
+- bundle resolution
+- multi-agent bundle selection
+- runtime-owned host bindings
+- runtime-owned session persistence
+- sandbox and approval policy
+- tool registry and capability binding
 
-- pending approval requests
-- session-scoped `allow_always` decisions
+For Rust-authored agents, `odyssey-rs-agent-sdk` is the stable integration layer on top of those
+host bindings. It injects the resolved host tool catalog into the AutoAgents executor and lets
+agent crates add Rust-defined custom tools without duplicating the built-in tool declarations from
+`agent.yaml`.
 
-It is intentionally ephemeral. Approvals do not survive process restarts.
+## WASM Runner Boundary
 
-### Sandbox runtimes
+The WASM host is embedded inside `odyssey-rs-runtime`. The bridge is intentionally narrow:
 
-`OdysseyRuntime` keeps two shared sandbox runtimes alive:
+- Odyssey sends one JSON `run` request into the component.
+- The component runs real AutoAgents Rust code inside the component.
+- The component imports model, tool, and event services from Odyssey through WIT host bindings.
+- Odyssey owns credentials, provider construction, approvals, and sandboxing.
 
-- one host runtime for `danger_full_access`
-- one restricted runtime for confined execution
+This keeps the agent module away from direct model credentials and direct tool execution while still
+allowing most AutoAgents Rust code to compile into the bundle.
 
-Each `SandboxRuntime` manages prepared cells and reuses them across turns when the session, agent,
-and policy match.
+## Security Boundary
 
-## Sessions, Turns, and Ordering
+The trusted runtime boundary is still Odyssey, not the agent module.
 
-The runtime is concurrent across sessions but serialized within a session.
+The agent module does not receive:
 
-Two pieces make that work:
+- direct model credentials
+- direct tool handles
+- ambient filesystem access through the runtime bridge
+- ambient network access through the runtime bridge
 
-- the scheduler limits global concurrency with a semaphore
-- `SessionExecutionGuards` hold a per-session async mutex so only one turn or direct operator
-  command runs in a given session at a time
+Privileged effects remain runtime-owned and brokered.
 
-That design avoids races in session history, approvals, and sandbox cell reuse while still allowing
-different sessions to execute in parallel.
+## Current Limits
 
-## Managed Sandbox Cells
-
-Restricted execution is built around reusable managed cells. A cell is identified by a
-`SandboxCellKey` containing:
-
-- an optional `session_id`
-- the `agent_id`
-- the cell kind
-- a component id
-
-The runtime currently uses tooling cells for bundle execution. Each managed cell is laid out like
-this:
-
-```text
-<cell>/
-  app/          # staged bundle contents
-  data/
-    home/       # HOME for sandboxed processes
-  cache/        # runtime-owned caches
-  tmp/          # private tmp area
-  runs/         # per-execution scratch directories
-```
-
-Each execution inside a cell gets its own scratch layout under `runs/<uuid>/`:
-
-```text
-<run>/
-  inbox/
-  outbox/
-  work/
-  tmp/
-```
-
-This split is the core of Odyssey's sandbox filesystem model:
-
-- `app/` can stay read-only in restricted modes
-- tools still get writable `HOME`, temp, cache, and per-run work areas
-- cells can be reused without rebuilding global sandbox state every turn
-
-## Turn Execution Pipeline
-
-A submitted turn currently follows this path:
-
-1. Load the session record from `SessionStore`.
-2. Resolve the bundle and default agent from `BundleStore`.
-3. Choose the effective sandbox mode from the runtime override or the manifest default.
-4. Prepare or reuse a sandbox cell for the session and bundle policy.
-5. Build tool permission rules from `agent.yaml`.
-6. Load bundle skills and build the effective system prompt.
-7. Select the tool subset from the registry.
-8. Resolve the model provider from the session model or per-turn model override.
-9. Build memory from prior turns.
-10. Run the executor.
-11. Collect session events into normalized chat history.
-12. Persist the completed turn.
-
-Two points are easy to miss:
-
-- the runtime builds memory after loading session history, not from raw event replay alone
-- the executor runs with an execution-local `ToolContext`, not direct access to process-global state
-
-## Tool Calls Versus Direct Operator Commands
-
-Odyssey has two different command-execution paths.
-
-### Agent tool path
-
-When the agent uses `Bash`, the flow is:
-
-- tool selection decides whether `Bash` is available
-- tool permission rules decide whether the specific call is allowed, denied, or needs approval
-- sandbox exec policy decides whether the shell and subcommands are executable
-- events are emitted as tool events and, when a process runs, as `ExecCommand*` events
-
-### Operator command path
-
-When an operator uses `run_session_command` or a local TUI command such as `!ls`, the flow is:
-
-- the runtime resolves the session bundle
-- it prepares the same session sandbox cell
-- it builds an operator-specific command policy
-- it runs the command directly, without the bundle `Bash` tool wrapper
-
-This path is intentionally separate because it is an operator surface, not an agent decision. It
-still emits `ExecCommand*` events, but it does not append a normal turn to session history.
-
-## Scheduler And Execution Status
-
-The scheduler is an in-process queue backed by:
-
-- a Tokio `mpsc` channel for pending jobs
-- a semaphore that enforces `worker_count`
-- an in-memory `turn_id -> ExecutionStatus` map
-
-`submit` enqueues work and returns an `ExecutionHandle`. `run` uses the same scheduler but waits on
-a completion channel for the final `RunOutput`.
-
-There is no distributed worker tier in the current repository. All concurrency control is local to
-one runtime process.
-
-## Persistence And Cleanup Boundaries
-
-### Session persistence
-
-Session state is durable. If the runtime restarts, previously completed turns remain available for:
-
-- session inspection
-- future memory construction
-- TUI or API history views
-
-### Approval state
-
-Approval state is not durable. Pending approvals and `allow_always` decisions live only in memory.
-
-### Sandbox cleanup
-
-Deleting a session is a full cleanup operation:
-
-- it waits for in-flight work on that session to finish
-- it removes the persisted session file
-- it clears approval state
-- it shuts down sandbox cells for the session in both sandbox runtimes
-
-That is why `delete_session` is asynchronous in the runtime API.
-
-## Transport Surfaces
-
-Three user-facing surfaces sit on top of the same runtime:
-
-- the CLI constructs `OdysseyRuntime` directly for local workflows
-- the HTTP server constructs one runtime and exposes routes plus SSE event streaming
-- the TUI constructs `OdysseyRuntime` directly and renders the session event stream
-
-The HTTP server is not a separate engine. It is a thin transport adapter over the same runtime.
-
-## Security Boundary In V1
-
-In the current design, the bundle manifest is trusted configuration authored by the operator. That
-means:
-
-- mounts
-- env passthrough
-- system tool exposure
-- network mode
-- bundle-local executable paths
-
-are all enforced as declared by the bundle author. The runtime is strict about applying that policy,
-but it does not yet treat the manifest itself as hostile input. That is an explicit v1 boundary,
-not an accident.
+- Rust is the only supported WASM authoring path today.
+- One agent is executed per run, even though a bundle may package many agents.
+- Child-run spawning is not yet wired through the host-binding model.
+- Wasm execution is runtime-owned and in-process; stronger execution limits and cancellation remain the next hardening step.

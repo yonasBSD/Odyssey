@@ -20,6 +20,8 @@ pub enum RuntimeError {
     Executor(String),
     #[error("template error: {0}")]
     Template(String),
+    #[error("invalid runtime state: {0}")]
+    Invalid(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
 }

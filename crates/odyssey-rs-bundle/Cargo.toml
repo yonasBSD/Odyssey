@@ -24,6 +24,7 @@ hex.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
 directories.workspace = true
+ignore = "0.4.25"
 base64 = "0.22.1"
 tempfile.workspace = true
 

@@ -1,11 +1,31 @@
-id: {{ bundle_id }}
-description: {{ bundle_id }} agent using Odyssey runtime
-prompt: |
-  You are a helpful assistant Tess, Created by LiquidOS.
-model:
-  provider: openai
-  name: gpt-4.1-mini
-tools:
-  allow: []
-  ask: []
-  deny: []
+apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {{ bundle_id }}
+  version: 0.1.0
+  description: "{{ bundle_id }} agent using Odyssey runtime"
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: |
+    You are a helpful assistant Tess, Created by LiquidOS.
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  program:
+    runner_class: prompt-inline
+  execution:
+    executor: react/v1
+    memory: session-window/v1
+  requires:
+    features:
+      - streaming
+  policyHints:
+    isolation_class: default
+    network: denied
+    filesystem: brokered
+  tools:
+    require: []
+    allow: []
+    ask: []
+    deny: []

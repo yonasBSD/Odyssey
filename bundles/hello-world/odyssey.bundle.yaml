@@ -1,0 +1,48 @@
+apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: hello-world
+  version: 0.1.0
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: weather
+      path: skills/weather
+  tools:
+    - name: Read
+      source: builtin
+    - name: Write
+      source: builtin
+    - name: Edit
+      source: builtin
+    - name: LS
+      source: builtin
+    - name: Glob
+      source: builtin
+    - name: Grep
+      source: builtin
+    - name: Bash
+      source: builtin
+    - name: Skill
+      source: builtin
+  sandbox:
+    mode: read_only
+    env: {}
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network:
+        - "*"
+    system_tools_mode: standard
+    system_tools: []
+    resources:
+      cpu: 1
+      memory_mb: 512
+  agents:
+    - id: hello-world
+      spec: agents/hello-world/agent.yaml
+      default: true

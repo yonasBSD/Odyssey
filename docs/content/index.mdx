@@ -29,7 +29,7 @@ cargo install odyssey-rs
 
 - [Getting Started](/getting-started) for the first local bundle workflow
 - [CLI and Server](/cli-and-server) for commands, bundle references, and HTTP routes
-- [Bundle Format](/bundle-format) for `odyssey.bundle.json5`, `agent.yaml`, and build layout
+- [Bundle Format](/bundle-format) for `odyssey.bundle.yaml`, per-agent `agent.yaml`, and build layout
 - [Sandbox and Tools](/sandbox-and-tools) for confinement, mounts, exec policy, and approvals
 - [Runtime Model](/runtime-model) for the public runtime API and execution lifecycle
 - [Events and Approvals](/events-and-approvals) for session event streaming and approval flow
@@ -60,10 +60,11 @@ cargo install odyssey-rs
 - The runtime persists sessions to disk and streams execution events in real time.
 - Builtin tools cover file access, search, edits, shell commands, and bundle skill lookup.
 - The only executor currently implemented is `react`.
-- The only memory provider currently implemented is `sliding_window`.
+- The only memory provider currently implemented is `session-window/v1`.
 - Manifest tool entries currently support builtin tools only.
 - Cloud model providers currently wired into the runtime are Anthropic, Azure OpenAI, DeepSeek,
   Google or Gemini, Groq, MiniMax, OpenAI, OpenRouter, Phind, and xAI.
+- Local Hugging Face-backed llama.cpp models are also supported through the `llama_cpp` provider.
 
 ## Platform Notes
 

@@ -5,8 +5,8 @@ use anyhow::Result;
 use log::info;
 use odyssey_rs_bundle::{BundleInstallSummary, BundleMetadata, BundleStore};
 use odyssey_rs_protocol::{
-    ApprovalDecision, BundleRef, ExecutionRequest, Session, SessionFilter, SessionSpec,
-    SessionSummary, SkillSummary, Task,
+    ApprovalDecision, BundleRef, ExecutionRequest, Session, SessionFilter, SessionSandboxOverlay,
+    SessionSpec, SessionSummary, SkillSummary, Task,
 };
 use odyssey_rs_runtime::{OdysseyRuntime, RunOutput, SessionCommandOutput};
 use std::path::Path;
@@ -77,11 +77,28 @@ impl AgentRuntimeClient {
     }
 
     /// Create a session for the configured bundle.
-    pub async fn create_session(&self, _agent_id: Option<String>) -> Result<Uuid> {
-        Ok(self
-            .runtime
-            .create_session(SessionSpec::from(self.bundle_ref()))?
-            .id)
+    pub async fn create_session_spec(&self, spec: SessionSpec) -> Result<Uuid> {
+        Ok(self.runtime.create_session(spec)?.id)
+    }
+
+    /// Create a session for the configured bundle.
+    pub async fn create_session(&self, agent_id: Option<String>) -> Result<Uuid> {
+        self.create_session_with_sandbox(agent_id, None).await
+    }
+
+    pub async fn create_session_with_sandbox(
+        &self,
+        agent_id: Option<String>,
+        sandbox: Option<SessionSandboxOverlay>,
+    ) -> Result<Uuid> {
+        self.create_session_spec(SessionSpec {
+            bundle_ref: BundleRef::from(self.bundle_ref()),
+            agent_id,
+            model: None,
+            sandbox,
+            metadata: serde_json::json!({}),
+        })
+        .await
     }
 
     /// Fetch a session by id.
@@ -174,11 +191,12 @@ impl AgentRuntimeClient {
 #[cfg(test)]
 mod tests {
     use super::AgentRuntimeClient;
-    use odyssey_rs_protocol::ApprovalDecision;
-    use odyssey_rs_protocol::SandboxMode;
-    use odyssey_rs_protocol::Task;
-    use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig, RuntimeEngine};
+    use odyssey_rs_protocol::{ApprovalDecision, DEFAULT_HUB_URL, SandboxMode, Task};
+    use odyssey_rs_runtime::{
+        AgentRuntimeConfig, BundleRuntimeConfig, OdysseyRuntime, RuntimeConfig, RuntimeEngine,
+    };
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -192,9 +210,10 @@ mod tests {
             sandbox_root: root.join("sandbox"),
             bind_addr: "127.0.0.1:0".to_string(),
             sandbox_mode_override: Some(SandboxMode::DangerFullAccess),
-            hub_url: "http://127.0.0.1:8473".to_string(),
+            hub_url: DEFAULT_HUB_URL.to_string(),
             worker_count: 2,
             queue_capacity: 32,
+            ..RuntimeConfig::default()
         }
     }
 
@@ -206,44 +225,63 @@ mod tests {
         skill_name: &str,
         skill_description: &str,
     ) {
+        let agent_root = root.join("agents").join(agent_id);
         fs::create_dir_all(root.join("skills").join(skill_name)).expect("create skill dir");
         fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
         fs::write(
-            root.join("odyssey.bundle.json5"),
+            root.join("odyssey.bundle.yaml"),
             format!(
-                r#"{{
-                    id: "{bundle_id}",
-                    version: "0.1.0",
-                    manifest_version: "odyssey.bundle/v1",
-                    readme: "README.md",
-                    agent_spec: "agent.yaml",
-                    executor: {{ type: "prebuilt", id: "react" }},
-                    memory: {{ type: "prebuilt", id: "sliding_window" }},
-                    skills: [{{ name: "{skill_name}", path: "skills/{skill_name}" }}],
-                    tools: [{{ name: "Read", source: "builtin" }}],
-                    sandbox: {{
-                        permissions: {{
-                            filesystem: {{ exec: [], mounts: {{ read: [], write: [] }} }},
-                            network: ["*"]
-                        }},
-                        system_tools: [],
-                        resources: {{}}
-                    }}
-                }}"#
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: {skill_name}
+      path: skills/{skill_name}
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network: ["*"]
+    system_tools: []
+    resources: {{}}
+  agents:
+    - id: {agent_id}
+      spec: agents/{agent_id}/agent.yaml
+      default: true
+"#
             ),
         )
         .expect("write manifest");
         fs::write(
-            root.join("agent.yaml"),
+            agent_root.join("agent.yaml"),
             format!(
-                r#"id: {agent_id}
-description: test bundle
-prompt: keep responses concise
-model:
-  provider: openai
-  name: {model_name}
-tools:
-  allow: ["Read", "Skill"]
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {agent_id}
+  version: 0.1.0
+  description: test bundle
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: {model_name}
+  tools:
+    allow: ["Read", "Skill"]
 "#
             ),
         )
@@ -426,5 +464,46 @@ tools:
         assert_eq!(output.stdout, "client-direct");
         assert_eq!(output.stderr, "");
         assert_eq!(output.status_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn client_uses_runtime_model_override_for_listing_and_sessions() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = runtime_config(temp.path());
+        config.bundle_overrides.insert(
+            "alpha@latest".to_string(),
+            BundleRuntimeConfig {
+                agents: BTreeMap::from([(
+                    "alpha-agent".to_string(),
+                    AgentRuntimeConfig {
+                        model: Some("gpt-5.4".to_string()),
+                        model_provider: Some("openai".to_string()),
+                        model_config: Some(serde_json::json!({
+                            "reasoning_effort": "high"
+                        })),
+                        sandbox: None,
+                    },
+                )]),
+            },
+        );
+        let runtime = Arc::new(RuntimeEngine::new(config).expect("runtime"));
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(
+            &project,
+            "alpha",
+            "alpha-agent",
+            "gpt-4.1-mini",
+            "repo-hygiene",
+            "Keep commits focused.",
+        );
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let client = AgentRuntimeClient::new(runtime, "local/alpha@0.1.0".to_string());
+        assert_eq!(client.list_models().await.expect("models"), vec!["gpt-5.4"]);
+
+        let session_id = client.create_session(None).await.expect("create session");
+        let session = client.get_session(session_id).await.expect("get session");
+        assert_eq!(session.model_id, "gpt-5.4");
     }
 }

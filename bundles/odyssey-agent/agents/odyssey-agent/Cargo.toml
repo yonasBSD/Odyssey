@@ -1,0 +1,16 @@
+[package]
+name = "odyssey-rs-odyssey-agent-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+autoagents = { workspace = true }
+autoagents-derive = { workspace = true }
+odyssey-rs-agent-sdk = { path = "../../../../crates/odyssey-rs-agent-sdk" }
+serde_json = "1"
+wit-bindgen = "0.51.0"
+serde = { workspace = true }

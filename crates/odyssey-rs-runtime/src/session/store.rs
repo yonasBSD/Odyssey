@@ -4,6 +4,7 @@ use autoagents_llm::{FunctionCall, ToolCall};
 use chrono::{DateTime, Utc};
 use log::warn;
 use odyssey_rs_protocol::EventMsg;
+use odyssey_rs_protocol::SessionSandboxOverlay;
 use odyssey_rs_protocol::Task;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ pub(crate) struct SessionRecord {
     pub model_id: String,
     #[serde(default)]
     pub model_config: Option<Value>,
+    #[serde(default)]
+    pub sandbox: Option<SessionSandboxOverlay>,
     pub created_at: DateTime<Utc>,
     pub turns: Vec<TurnRecord>,
 }
@@ -211,6 +214,7 @@ impl SessionStore {
         model_provider: String,
         model_id: String,
         model_config: Option<Value>,
+        sandbox: Option<SessionSandboxOverlay>,
     ) -> Result<SessionRecord, RuntimeError> {
         let id = Uuid::new_v4();
         let record = SessionRecord {
@@ -220,6 +224,7 @@ impl SessionStore {
             model_provider,
             model_id,
             model_config,
+            sandbox,
             created_at: Utc::now(),
             turns: Vec::new(),
         };
@@ -478,6 +483,7 @@ mod tests {
             model_provider: "openai".to_string(),
             model_id: "gpt-4.1-mini".to_string(),
             model_config: None,
+            sandbox: None,
             created_at: Utc::now(),
             turns: vec![TurnRecord {
                 turn_id: Uuid::new_v4(),
@@ -525,6 +531,7 @@ mod tests {
                 "openai".to_string(),
                 "gpt-4.1-mini".to_string(),
                 None,
+                None,
             )
             .expect("session");
         let turn = TurnRecord::from_history(
@@ -561,6 +568,7 @@ mod tests {
                 "openai".to_string(),
                 "gpt-5".to_string(),
                 Some(json!({ "reasoning_effort": "high" })),
+                None,
             )
             .expect("session");
 
@@ -582,6 +590,7 @@ mod tests {
             model_provider: "openai".to_string(),
             model_id: "gpt-4.1-mini".to_string(),
             model_config: None,
+            sandbox: None,
             created_at: Utc::now(),
             turns: Vec::new(),
         };
@@ -623,6 +632,7 @@ mod tests {
                 "openai".to_string(),
                 "gpt-4.1-mini".to_string(),
                 None,
+                None,
             )
             .expect_err("persist failure");
 
@@ -640,6 +650,7 @@ mod tests {
                 "odyssey-cowork".to_string(),
                 "openai".to_string(),
                 "gpt-4.1-mini".to_string(),
+                None,
                 None,
             )
             .expect("session");

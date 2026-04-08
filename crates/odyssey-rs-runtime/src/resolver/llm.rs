@@ -1,4 +1,7 @@
 use crate::RuntimeError;
+use autoagents_llamacpp::{
+    LlamaCppProvider, LlamaCppReasoningFormat, LlamaCppSplitMode, ModelSource,
+};
 use autoagents_llm::{
     HasConfig, LLMProvider as AutoAgentsLLMProvider,
     backends::{
@@ -10,11 +13,11 @@ use autoagents_llm::{
     chat::ReasoningEffort,
 };
 use odyssey_rs_protocol::ModelSpec;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{env, sync::Arc};
 
-type DynLLMProvider = Arc<dyn AutoAgentsLLMProvider>;
+pub(crate) type DynLLMProvider = Arc<dyn AutoAgentsLLMProvider>;
 
 macro_rules! apply_option {
     ($builder:expr, $value:expr, $method:ident) => {{
@@ -100,7 +103,7 @@ impl From<&str> for LocalLLMProvider {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-struct LLMConfig {
+struct CloudLLMConfig {
     #[serde(alias = "apiKey")]
     api_key: Option<String>,
     #[serde(alias = "baseUrl")]
@@ -135,6 +138,89 @@ struct LLMConfig {
     extra_body: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LlamaCppSplitModeConfig {
+    None,
+    Layer,
+    Row,
+}
+
+impl From<LlamaCppSplitModeConfig> for LlamaCppSplitMode {
+    fn from(value: LlamaCppSplitModeConfig) -> Self {
+        match value {
+            LlamaCppSplitModeConfig::None => Self::None,
+            LlamaCppSplitModeConfig::Layer => Self::Layer,
+            LlamaCppSplitModeConfig::Row => Self::Row,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+struct LlamaCppRuntimeConfig {
+    #[serde(alias = "hfRepoId", alias = "repoId", alias = "repo_id")]
+    hf_repo_id: Option<String>,
+    #[serde(alias = "hfFilename", alias = "filename")]
+    hf_filename: Option<String>,
+    #[serde(
+        alias = "hfMmprojFilename",
+        alias = "hfMMProjFilename",
+        alias = "mmprojFilename",
+        alias = "mmproj_filename"
+    )]
+    hf_mmproj_filename: Option<String>,
+    #[serde(alias = "hfRevision", alias = "revision")]
+    hf_revision: Option<String>,
+    #[serde(alias = "modelDir")]
+    model_dir: Option<String>,
+    #[serde(alias = "chatTemplate")]
+    chat_template: Option<String>,
+    #[serde(alias = "systemPrompt")]
+    system_prompt: Option<String>,
+    #[serde(alias = "forceJsonGrammar")]
+    force_json_grammar: Option<bool>,
+    #[serde(alias = "reasoningFormat")]
+    reasoning_format: Option<LlamaCppReasoningFormat>,
+    #[serde(alias = "extraBody")]
+    extra_body: Option<Value>,
+    #[serde(alias = "maxTokens")]
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    #[serde(alias = "topP")]
+    top_p: Option<f32>,
+    #[serde(alias = "topK")]
+    top_k: Option<u32>,
+    #[serde(alias = "repeatPenalty")]
+    repeat_penalty: Option<f32>,
+    #[serde(alias = "frequencyPenalty")]
+    frequency_penalty: Option<f32>,
+    #[serde(alias = "presencePenalty")]
+    presence_penalty: Option<f32>,
+    #[serde(alias = "repeatLastN")]
+    repeat_last_n: Option<i32>,
+    seed: Option<u32>,
+    #[serde(alias = "nCtx")]
+    n_ctx: Option<u32>,
+    #[serde(alias = "nBatch")]
+    n_batch: Option<u32>,
+    #[serde(alias = "nUbatch", alias = "nUBatch")]
+    n_ubatch: Option<u32>,
+    #[serde(alias = "nThreads")]
+    n_threads: Option<i32>,
+    #[serde(alias = "nThreadsBatch")]
+    n_threads_batch: Option<i32>,
+    #[serde(alias = "nGpuLayers")]
+    n_gpu_layers: Option<u32>,
+    #[serde(alias = "mainGpu")]
+    main_gpu: Option<i32>,
+    #[serde(alias = "splitMode")]
+    split_mode: Option<LlamaCppSplitModeConfig>,
+    #[serde(alias = "useMlock")]
+    use_mlock: Option<bool>,
+    devices: Option<Vec<usize>>,
+}
+
 pub(crate) struct LLMResolver<'a> {
     model_spec: &'a ModelSpec,
 }
@@ -144,12 +230,13 @@ impl<'a> LLMResolver<'a> {
         Self { model_spec }
     }
 
-    pub fn build_llm(&self) -> Result<DynLLMProvider, RuntimeError> {
-        let config = self.parse_config()?;
-
+    pub async fn build_llm(&self) -> Result<DynLLMProvider, RuntimeError> {
         match LLMProvider::from(self.model_spec.provider.as_str()) {
-            LLMProvider::Cloud(provider) => self.build_cloud_llm(provider, &config),
-            LLMProvider::Local(provider) => self.build_local_llm(provider),
+            LLMProvider::Cloud(provider) => {
+                let config = self.parse_config::<CloudLLMConfig>()?;
+                self.build_cloud_llm(provider, &config)
+            }
+            LLMProvider::Local(provider) => self.build_local_llm(provider).await,
             LLMProvider::Unknown => Err(RuntimeError::Unsupported(format!(
                 "unsupported model provider: {}",
                 self.model_spec.provider
@@ -157,16 +244,99 @@ impl<'a> LLMResolver<'a> {
         }
     }
 
-    fn build_local_llm(&self, _provider: LocalLLMProvider) -> Result<DynLLMProvider, RuntimeError> {
-        Err(RuntimeError::Unsupported(
-            "local model support is not yet implemented".to_string(),
-        ))
+    async fn build_local_llm(
+        &self,
+        provider: LocalLLMProvider,
+    ) -> Result<DynLLMProvider, RuntimeError> {
+        match provider {
+            LocalLLMProvider::LlamaCpp => self.build_llamacpp_llm().await,
+            LocalLLMProvider::Unknown => Err(RuntimeError::Unsupported(format!(
+                "unsupported model provider: {}",
+                self.model_spec.provider
+            ))),
+        }
+    }
+
+    async fn build_llamacpp_llm(&self) -> Result<DynLLMProvider, RuntimeError> {
+        let config = self.parse_config::<LlamaCppRuntimeConfig>()?;
+        let repo_id = self.require_non_empty_config_string(
+            config.hf_repo_id.as_deref(),
+            "llama_cpp",
+            "hf_repo_id",
+        )?;
+
+        let LlamaCppRuntimeConfig {
+            hf_filename,
+            hf_mmproj_filename,
+            hf_revision,
+            model_dir,
+            chat_template,
+            system_prompt,
+            force_json_grammar,
+            reasoning_format,
+            extra_body,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+            frequency_penalty,
+            presence_penalty,
+            repeat_last_n,
+            seed,
+            n_ctx,
+            n_batch,
+            n_ubatch,
+            n_threads,
+            n_threads_batch,
+            n_gpu_layers,
+            main_gpu,
+            split_mode,
+            use_mlock,
+            devices,
+            ..
+        } = config;
+
+        let mut builder = LlamaCppProvider::builder().model_source(ModelSource::HuggingFace {
+            repo_id,
+            filename: hf_filename,
+            mmproj_filename: hf_mmproj_filename,
+        });
+        builder = apply_option!(builder, chat_template.as_deref(), chat_template);
+        builder = apply_option!(builder, system_prompt.as_deref(), system_prompt);
+        builder = apply_option!(builder, force_json_grammar, force_json_grammar);
+        builder = apply_option!(builder, reasoning_format, reasoning_format);
+        builder = apply_option!(builder, extra_body.as_ref(), extra_body);
+        builder = apply_option!(builder, model_dir.as_deref(), model_dir);
+        builder = apply_option!(builder, hf_revision.as_deref(), hf_revision);
+        builder = apply_option!(builder, max_tokens, max_tokens);
+        builder = apply_option!(builder, temperature, temperature);
+        builder = apply_option!(builder, top_p, top_p);
+        builder = apply_option!(builder, top_k, top_k);
+        builder = apply_option!(builder, repeat_penalty, repeat_penalty);
+        builder = apply_option!(builder, frequency_penalty, frequency_penalty);
+        builder = apply_option!(builder, presence_penalty, presence_penalty);
+        builder = apply_option!(builder, repeat_last_n, repeat_last_n);
+        builder = apply_option!(builder, seed, seed);
+        builder = apply_option!(builder, n_ctx, n_ctx);
+        builder = apply_option!(builder, n_batch, n_batch);
+        builder = apply_option!(builder, n_ubatch, n_ubatch);
+        builder = apply_option!(builder, n_threads, n_threads);
+        builder = apply_option!(builder, n_threads_batch, n_threads_batch);
+        builder = apply_option!(builder, n_gpu_layers, n_gpu_layers);
+        builder = apply_option!(builder, main_gpu, main_gpu);
+        builder = apply_option!(builder, split_mode.map(Into::into), split_mode);
+        builder = apply_option!(builder, use_mlock, use_mlock);
+        builder = apply_option!(builder, devices, devices);
+
+        let llm = builder.build().await.map_err(Self::map_provider_error)?;
+        Ok(Arc::new(llm))
     }
 
     fn build_cloud_llm(
         &self,
         provider: CloudLLMProvider,
-        config: &LLMConfig,
+        config: &CloudLLMConfig,
     ) -> Result<DynLLMProvider, RuntimeError> {
         match provider {
             CloudLLMProvider::Anthropic => self.build_anthropic_llm(config),
@@ -186,7 +356,7 @@ impl<'a> LLMResolver<'a> {
         }
     }
 
-    fn build_anthropic_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_anthropic_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "anthropic", &["ANTHROPIC_API_KEY"])?;
 
         let mut builder = LLMBuilder::<Anthropic>::new()
@@ -204,7 +374,10 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_azure_openai_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_azure_openai_llm(
+        &self,
+        config: &CloudLLMConfig,
+    ) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "azure-openai", &["AZURE_OPENAI_API_KEY"])?;
         let endpoint = self.require_string_setting(
             config.base_url.as_deref(),
@@ -244,7 +417,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_deepseek_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_deepseek_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "deepseek", &["DEEPSEEK_API_KEY"])?;
 
         Ok(Arc::new(DeepSeek::new_with_options(
@@ -259,7 +432,7 @@ impl<'a> LLMResolver<'a> {
         )))
     }
 
-    fn build_google_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_google_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key =
             self.require_api_key(config, "google", &["GOOGLE_API_KEY", "GEMINI_API_KEY"])?;
 
@@ -272,7 +445,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_groq_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_groq_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "groq", &["GROQ_API_KEY"])?;
 
         let mut builder = LLMBuilder::<Groq>::new()
@@ -292,7 +465,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_minimax_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_minimax_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "minimax", &["MINIMAX_API_KEY"])?;
 
         let mut builder = LLMBuilder::<MiniMax>::new()
@@ -312,7 +485,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_openai_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_openai_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "openai", &["OPENAI_API_KEY"])?;
 
         let mut builder = LLMBuilder::<OpenAI>::new()
@@ -333,7 +506,10 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_openrouter_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_openrouter_llm(
+        &self,
+        config: &CloudLLMConfig,
+    ) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "openrouter", &["OPENROUTER_API_KEY"])?;
 
         let mut builder = LLMBuilder::<OpenRouter>::new()
@@ -353,7 +529,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_phind_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_phind_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let mut builder = LLMBuilder::<Phind>::new().model(self.model_spec.name.as_str());
         builder = self.apply_shared_generation_config(builder, config);
 
@@ -361,7 +537,7 @@ impl<'a> LLMResolver<'a> {
         Ok(llm)
     }
 
-    fn build_xai_llm(&self, config: &LLMConfig) -> Result<DynLLMProvider, RuntimeError> {
+    fn build_xai_llm(&self, config: &CloudLLMConfig) -> Result<DynLLMProvider, RuntimeError> {
         let api_key = self.require_api_key(config, "xai", &["XAI_API_KEY"])?;
 
         let mut builder = LLMBuilder::<XAI>::new()
@@ -382,7 +558,7 @@ impl<'a> LLMResolver<'a> {
     fn apply_shared_generation_config<L: AutoAgentsLLMProvider + HasConfig>(
         &self,
         mut builder: LLMBuilder<L>,
-        config: &LLMConfig,
+        config: &CloudLLMConfig,
     ) -> LLMBuilder<L> {
         builder = apply_option!(builder, config.base_url.as_deref(), base_url);
         builder = apply_option!(builder, config.max_tokens, max_tokens);
@@ -396,7 +572,7 @@ impl<'a> LLMResolver<'a> {
     fn apply_reasoning_effort<L: AutoAgentsLLMProvider + HasConfig>(
         &self,
         builder: LLMBuilder<L>,
-        config: &LLMConfig,
+        config: &CloudLLMConfig,
         provider_id: &str,
     ) -> Result<LLMBuilder<L>, RuntimeError> {
         let Some(reasoning_effort) = config.reasoning_effort.as_deref() else {
@@ -417,9 +593,12 @@ impl<'a> LLMResolver<'a> {
         Ok(builder.reasoning_effort(reasoning_effort))
     }
 
-    fn parse_config(&self) -> Result<LLMConfig, RuntimeError> {
+    fn parse_config<T>(&self) -> Result<T, RuntimeError>
+    where
+        T: DeserializeOwned + Default,
+    {
         match self.model_spec.config.as_ref() {
-            None | Some(Value::Null) => Ok(LLMConfig::default()),
+            None | Some(Value::Null) => Ok(T::default()),
             Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
                 RuntimeError::Unsupported(format!(
                     "invalid model config for provider {}: {err}",
@@ -431,11 +610,33 @@ impl<'a> LLMResolver<'a> {
 
     fn require_api_key(
         &self,
-        config: &LLMConfig,
+        config: &CloudLLMConfig,
         provider_id: &str,
         env_vars: &[&str],
     ) -> Result<String, RuntimeError> {
         self.require_string_setting(config.api_key.as_deref(), provider_id, "api_key", env_vars)
+    }
+
+    fn require_non_empty_config_string(
+        &self,
+        config_value: Option<&str>,
+        provider_id: &str,
+        config_field: &str,
+    ) -> Result<String, RuntimeError> {
+        let Some(config_value) = config_value else {
+            return Err(RuntimeError::Unsupported(format!(
+                "provider {provider_id} requires config.{config_field}"
+            )));
+        };
+
+        let trimmed = config_value.trim();
+        if trimmed.is_empty() {
+            return Err(RuntimeError::Unsupported(format!(
+                "provider {provider_id} requires non-empty config.{config_field}"
+            )));
+        }
+
+        Ok(trimmed.to_string())
     }
 
     fn require_string_setting(
@@ -515,7 +716,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_config_with_snake_and_camel_case_fields() {
+    fn parses_local_provider_aliases() {
+        assert_eq!(
+            LocalLLMProvider::from("llamacpp"),
+            LocalLLMProvider::LlamaCpp
+        );
+        assert_eq!(
+            LocalLLMProvider::from("llama-cpp"),
+            LocalLLMProvider::LlamaCpp
+        );
+        assert_eq!(
+            LocalLLMProvider::from("llama_cpp"),
+            LocalLLMProvider::LlamaCpp
+        );
+    }
+
+    #[test]
+    fn parses_cloud_config_with_snake_and_camel_case_fields() {
         let spec = model_spec(
             "openai",
             Some(json!({
@@ -535,7 +752,7 @@ mod tests {
         );
         let resolver = LLMResolver::new(&spec);
 
-        let config = resolver.parse_config().unwrap();
+        let config = resolver.parse_config::<CloudLLMConfig>().unwrap();
 
         assert_eq!(config.api_key, Some("key".to_string()));
         assert_eq!(config.base_url, Some("https://example.com/v1/".to_string()));
@@ -552,24 +769,109 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_config_fields() {
+    fn parses_llamacpp_config_with_snake_and_camel_case_fields() {
+        let spec = model_spec(
+            "llama_cpp",
+            Some(json!({
+                "hfRepoId": "unsloth/Qwen3.5-9B-GGUF",
+                "hfFilename": "Qwen3.5-9B-Q4_0.gguf",
+                "hfMmprojFilename": "mmproj.gguf",
+                "hfRevision": "main",
+                "modelDir": "/models",
+                "chatTemplate": "chatml",
+                "systemPrompt": "stay concise",
+                "forceJsonGrammar": true,
+                "reasoningFormat": "auto",
+                "extraBody": {
+                    "chat_template_kwargs": {
+                        "enable_thinking": true
+                    }
+                },
+                "maxTokens": 1024,
+                "temperature": 0.2,
+                "topP": 0.9,
+                "topK": 32,
+                "repeatPenalty": 1.1,
+                "frequencyPenalty": 0.3,
+                "presencePenalty": 0.4,
+                "repeatLastN": 64,
+                "seed": 7,
+                "nCtx": 4096,
+                "nBatch": 128,
+                "nUBatch": 64,
+                "nThreads": 8,
+                "nThreadsBatch": 4,
+                "nGpuLayers": 99,
+                "mainGpu": 0,
+                "splitMode": "layer",
+                "useMlock": true,
+                "devices": [0, 1]
+            })),
+        );
+        let resolver = LLMResolver::new(&spec);
+
+        let config = resolver.parse_config::<LlamaCppRuntimeConfig>().unwrap();
+
+        assert_eq!(
+            config.hf_repo_id,
+            Some("unsloth/Qwen3.5-9B-GGUF".to_string())
+        );
+        assert_eq!(config.hf_filename, Some("Qwen3.5-9B-Q4_0.gguf".to_string()));
+        assert_eq!(config.hf_mmproj_filename, Some("mmproj.gguf".to_string()));
+        assert_eq!(config.hf_revision, Some("main".to_string()));
+        assert_eq!(config.model_dir, Some("/models".to_string()));
+        assert_eq!(config.chat_template, Some("chatml".to_string()));
+        assert_eq!(config.system_prompt, Some("stay concise".to_string()));
+        assert_eq!(config.force_json_grammar, Some(true));
+        assert_eq!(config.reasoning_format, Some(LlamaCppReasoningFormat::Auto));
+        assert_eq!(config.max_tokens, Some(1024));
+        assert_eq!(config.n_ctx, Some(4096));
+        assert_eq!(config.n_threads, Some(8));
+        assert_eq!(config.n_threads_batch, Some(4));
+        assert_eq!(config.n_gpu_layers, Some(99));
+        assert_eq!(config.main_gpu, Some(0));
+        assert_eq!(config.split_mode, Some(LlamaCppSplitModeConfig::Layer));
+        assert_eq!(config.use_mlock, Some(true));
+        assert_eq!(config.devices, Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn rejects_unknown_cloud_config_fields() {
         let spec = model_spec(
             "openai",
             Some(json!({ "temperature": 0.2, "unknownField": true })),
         );
         let resolver = LLMResolver::new(&spec);
 
-        let err = resolver.parse_config().unwrap_err();
+        let err = resolver.parse_config::<CloudLLMConfig>().unwrap_err();
         assert!(err.to_string().contains("invalid model config"));
         assert!(err.to_string().contains("unknownField"));
     }
 
     #[test]
-    fn requires_credentials_for_openai() {
+    fn rejects_unknown_llamacpp_config_fields() {
+        let spec = model_spec(
+            "llama_cpp",
+            Some(json!({
+                "hf_repo_id": "unsloth/Qwen3.5-9B-GGUF",
+                "unknownField": true
+            })),
+        );
+        let resolver = LLMResolver::new(&spec);
+
+        let err = resolver
+            .parse_config::<LlamaCppRuntimeConfig>()
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid model config"));
+        assert!(err.to_string().contains("unknownField"));
+    }
+
+    #[tokio::test]
+    async fn requires_credentials_for_openai() {
         let spec = model_spec("openai", Some(json!({ "api_key": "   " })));
         let resolver = LLMResolver::new(&spec);
 
-        let err = match resolver.build_llm() {
+        let err = match resolver.build_llm().await {
             Ok(_) => panic!("expected openai config resolution to fail for blank api_key"),
             Err(err) => err,
         };
@@ -579,12 +881,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn requires_azure_endpoint_version_and_deployment() {
+    #[tokio::test]
+    async fn requires_azure_endpoint_version_and_deployment() {
         let spec = model_spec("azure-openai", Some(json!({ "api_key": "key" })));
         let resolver = LLMResolver::new(&spec);
 
-        let err = match resolver.build_llm() {
+        let err = match resolver.build_llm().await {
             Ok(_) => panic!("expected azure-openai config resolution to fail"),
             Err(err) => err,
         };
@@ -594,8 +896,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn requires_hf_repo_id_for_llamacpp() {
+        let spec = model_spec("llama_cpp", Some(json!({ "hf_repo_id": "   " })));
+        let resolver = LLMResolver::new(&spec);
+
+        let err = match resolver.build_llm().await {
+            Ok(_) => panic!("expected llama_cpp config resolution to fail for blank hf_repo_id"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("provider llama_cpp requires non-empty config.hf_repo_id")
+        );
+    }
+
     #[test]
-    fn builds_all_supported_cloud_providers_from_config() {
+    fn rejects_invalid_llamacpp_reasoning_format() {
+        let spec = model_spec(
+            "llama_cpp",
+            Some(json!({
+                "hf_repo_id": "unsloth/Qwen3.5-9B-GGUF",
+                "reasoning_format": "bad-value"
+            })),
+        );
+        let resolver = LLMResolver::new(&spec);
+
+        let err = resolver
+            .parse_config::<LlamaCppRuntimeConfig>()
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid model config"));
+        assert!(err.to_string().contains("bad-value"));
+    }
+
+    #[test]
+    fn rejects_invalid_llamacpp_split_mode() {
+        let spec = model_spec(
+            "llama_cpp",
+            Some(json!({
+                "hf_repo_id": "unsloth/Qwen3.5-9B-GGUF",
+                "split_mode": "bad-value"
+            })),
+        );
+        let resolver = LLMResolver::new(&spec);
+
+        let err = resolver
+            .parse_config::<LlamaCppRuntimeConfig>()
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid model config"));
+        assert!(err.to_string().contains("bad-value"));
+    }
+
+    #[tokio::test]
+    async fn builds_all_supported_cloud_providers_from_config() {
         let specs = [
             model_spec(
                 "openai",
@@ -714,7 +1067,7 @@ mod tests {
 
         for spec in specs {
             let provider = spec.provider.clone();
-            let llm = LLMResolver::new(&spec).build_llm();
+            let llm = LLMResolver::new(&spec).build_llm().await;
             assert!(
                 llm.is_ok(),
                 "expected provider {provider} to build successfully"

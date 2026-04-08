@@ -103,7 +103,7 @@ pub enum Command {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     info!("Running Odyssey CLI");
     validate_remote_usage(&cli)?;
-    let config = build_runtime_config(&cli);
+    let config = build_runtime_config(&cli)?;
     let start_time = Instant::now();
     let runtime = OdysseyRuntime::new(config.clone())?;
     let bundles = BundleStore::new(config.cache_root.clone());
@@ -118,8 +118,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
-    let mut config = RuntimeConfig::default();
+fn build_runtime_config(cli: &Cli) -> Result<RuntimeConfig> {
+    let mut config = RuntimeConfig::load()?;
     if let Some(remote) = &cli.remote {
         config.bind_addr.clone_from(remote);
     }
@@ -136,7 +136,7 @@ fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
     if let Some(hub_url) = hub_override(&cli.command) {
         config.hub_url = hub_url;
     }
-    config
+    Ok(config)
 }
 
 fn dangerous_sandbox_mode_enabled(command: &Command) -> bool {
@@ -529,7 +529,7 @@ mod tests {
     fn tui_dangerous_sandbox_mode_overrides_runtime_config() {
         let cli = Cli::parse_from(["odyssey-rs", "tui", "--dangerous-sandbox-mode"]);
 
-        let config = build_runtime_config(&cli);
+        let config = build_runtime_config(&cli).expect("runtime config");
 
         assert_eq!(
             config.sandbox_mode_override,

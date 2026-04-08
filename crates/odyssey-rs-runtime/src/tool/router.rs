@@ -18,6 +18,11 @@ pub fn select_tools(
             .collect()
     };
 
+    let required = explicitly_required_tools(agent);
+    if !required.is_empty() {
+        names.retain(|name| required.contains(name));
+    }
+
     if !agent.tools.allow.iter().any(|entry| entry == "*") {
         let allowed = explicitly_available_tools(agent);
         if !allowed.is_empty() {
@@ -46,6 +51,10 @@ fn explicitly_available_tools(agent: &AgentSpec) -> BTreeSet<String> {
         .collect()
 }
 
+fn explicitly_required_tools(agent: &AgentSpec) -> BTreeSet<String> {
+    agent.tools.require.iter().cloned().collect()
+}
+
 fn explicitly_denied_tools(agent: &AgentSpec) -> BTreeSet<String> {
     agent
         .tools
@@ -71,7 +80,7 @@ mod tests {
     use async_trait::async_trait;
     use odyssey_rs_manifest::{
         AgentSpec, AgentToolPolicy, BundleExecutor, BundleManifest, BundleMemory, BundleSandbox,
-        BundleTool, ManifestVersion, ProviderKind,
+        BundleSignatures, BundleTool, ManifestVersion, ProviderKind,
     };
     use odyssey_rs_protocol::ModelSpec;
     use odyssey_rs_tools::{Tool, ToolContext, ToolError, ToolRegistry};
@@ -103,11 +112,14 @@ mod tests {
 
     fn manifest(tools: Vec<&str>) -> BundleManifest {
         BundleManifest {
+            api_version: "odyssey.ai/bundle.v1".to_string(),
+            kind: "AgentBundle".to_string(),
             id: "demo".to_string(),
             version: "0.1.0".to_string(),
             manifest_version: ManifestVersion::V1,
+            abi_version: "v1".to_string(),
             readme: "README.md".to_string(),
-            agent_spec: "agent.yaml".to_string(),
+            agent_spec: "agents/demo/agent.yaml".to_string(),
             executor: BundleExecutor {
                 kind: ProviderKind::Prebuilt,
                 id: "react".to_string(),
@@ -123,12 +135,15 @@ mod tests {
                 })
                 .collect(),
             sandbox: BundleSandbox::default(),
+            signatures: BundleSignatures::default(),
+            agents: Vec::new(),
         }
     }
 
     fn agent(allow: Vec<&str>, ask: Vec<&str>, deny: Vec<&str>) -> AgentSpec {
         AgentSpec {
             id: "demo".to_string(),
+            name: "demo".to_string(),
             description: String::default(),
             prompt: "test".to_string(),
             model: ModelSpec {
@@ -137,10 +152,12 @@ mod tests {
                 config: None,
             },
             tools: AgentToolPolicy {
+                require: Vec::new(),
                 allow: allow.into_iter().map(ToString::to_string).collect(),
                 ask: ask.into_iter().map(ToString::to_string).collect(),
                 deny: deny.into_iter().map(ToString::to_string).collect(),
             },
+            ..AgentSpec::default()
         }
     }
 
@@ -217,6 +234,26 @@ mod tests {
                 Vec::new(),
                 vec!["Write", "Skill(repo-hygiene)", "Missing"],
             ),
+        );
+
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["Read".to_string(), "Skill".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_tools_applies_required_tool_filter_before_permissions() {
+        let mut agent = agent(vec!["*"], Vec::new(), Vec::new());
+        agent.tools.require = vec!["Read".to_string(), "Skill".to_string()];
+
+        let selected = select_tools(
+            &registry(),
+            &manifest(vec!["Read", "Write", "Skill"]),
+            &agent,
         );
 
         assert_eq!(

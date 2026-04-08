@@ -48,7 +48,7 @@ pub struct BundleConfig {
     pub namespace: String,
     pub readme: String,
     pub bundle_manifest: odyssey_rs_manifest::BundleManifest,
-    pub agent_spec: odyssey_rs_manifest::AgentSpec,
+    pub agents: Vec<odyssey_rs_manifest::AgentSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -537,8 +537,9 @@ mod tests {
         OCI_MANIFEST_MEDIA_TYPE,
     };
     use odyssey_rs_manifest::{
-        AgentSpec, AgentToolPolicy, BundleExecutor, BundleManifest, BundleMemory, BundleSandbox,
-        ManifestVersion, ProviderKind,
+        AgentExecution, AgentInterfaces, AgentKind, AgentPolicyHints, AgentProgram,
+        AgentRequirements, AgentSpec, AgentToolPolicy, BundleAgentEntry, BundleExecutor,
+        BundleManifest, BundleMemory, BundleSandbox, BundleSignatures, ManifestVersion,
     };
     use odyssey_rs_protocol::ModelSpec;
     use pretty_assertions::assert_eq;
@@ -554,32 +555,47 @@ mod tests {
             namespace: "local".to_string(),
             readme: "# demo\n".to_string(),
             bundle_manifest: BundleManifest {
+                manifest_version: ManifestVersion::default(),
+                api_version: "odyssey.ai/bundle.v1".to_string(),
+                kind: "AgentBundle".to_string(),
                 id: "demo".to_string(),
                 version: "0.1.0".to_string(),
-                manifest_version: ManifestVersion::V1,
+                abi_version: "v1".to_string(),
                 readme: "README.md".to_string(),
-                agent_spec: "agent.yaml".to_string(),
-                executor: BundleExecutor {
-                    kind: ProviderKind::Prebuilt,
-                    id: "react".to_string(),
-                    config: serde_json::Value::Null,
-                },
+                agent_spec: "agents/demo/agent.yaml".to_string(),
+                executor: BundleExecutor::default(),
                 memory: BundleMemory::default(),
                 skills: Vec::new(),
                 tools: Vec::new(),
                 sandbox: BundleSandbox::default(),
+                signatures: BundleSignatures::default(),
+                agents: vec![BundleAgentEntry {
+                    id: "demo".to_string(),
+                    spec: "agents/demo/agent.yaml".to_string(),
+                    module: Some("agents/demo/module.wasm".to_string()),
+                    default: true,
+                }],
             },
-            agent_spec: AgentSpec {
+            agents: vec![AgentSpec {
                 id: "demo".to_string(),
+                name: "demo".to_string(),
+                version: "0.1.0".to_string(),
                 description: "demo bundle".to_string(),
+                kind: AgentKind::Prompt,
+                abi_version: "v1".to_string(),
                 prompt: "be concise".to_string(),
                 model: ModelSpec {
                     provider: "openai".to_string(),
                     name: "gpt-4.1-mini".to_string(),
                     config: None,
                 },
+                program: AgentProgram::default(),
+                execution: AgentExecution::default(),
+                interfaces: AgentInterfaces::default(),
+                requires: AgentRequirements::default(),
+                policy_hints: AgentPolicyHints::default(),
                 tools: AgentToolPolicy::default(),
-            },
+            }],
         }
     }
 
@@ -590,7 +606,13 @@ mod tests {
 
         fs::create_dir_all(root.join("skills").join("repo")).expect("create skill dir");
         fs::create_dir_all(root.join("blobs").join("sha256")).expect("create blob dir");
-        fs::write(root.join("agent.yaml"), "id: demo\n").expect("write agent");
+        fs::create_dir_all(root.join("agents").join("demo")).expect("create agent dir");
+        fs::write(root.join("odyssey.bundle.yaml"), "kind: AgentBundle\n").expect("write bundle");
+        fs::write(
+            root.join("agents").join("demo").join("agent.yaml"),
+            "id: demo\n",
+        )
+        .expect("write agent");
         fs::write(
             root.join("skills").join("repo").join("SKILL.md"),
             "# Repo\n",
@@ -606,7 +628,8 @@ mod tests {
         unpack_payload(&payload, &out).expect("unpack payload");
 
         assert_eq!(
-            fs::read_to_string(out.join("agent.yaml")).expect("read unpacked agent"),
+            fs::read_to_string(out.join("agents").join("demo").join("agent.yaml"))
+                .expect("read unpacked agent"),
             "id: demo\n"
         );
         assert_eq!(
@@ -626,8 +649,12 @@ mod tests {
         let root = temp.path();
 
         let payload_root = root.join("payload");
-        fs::create_dir_all(&payload_root).expect("create payload root");
-        fs::write(payload_root.join("agent.yaml"), "id: demo\n").expect("write payload file");
+        fs::create_dir_all(payload_root.join("agents").join("demo")).expect("create payload root");
+        fs::write(
+            payload_root.join("agents").join("demo").join("agent.yaml"),
+            "id: demo\n",
+        )
+        .expect("write payload file");
         let layer_bytes = pack_payload(&payload_root).expect("pack layer");
         let layer_digest = write_blob(root, &layer_bytes).expect("write layer blob");
 

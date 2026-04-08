@@ -42,8 +42,8 @@ odyssey-rs init ./hello-world
 
 The template creates a small bundle project:
 
-- `odyssey.bundle.json5`
-- `agent.yaml`
+- `odyssey.bundle.yaml`
+- `agents/<bundle-id>/agent.yaml`
 - `README.md`
 - `skills/`
 - `resources/`
@@ -51,9 +51,10 @@ The template creates a small bundle project:
 The starter template is intentionally usable out of the box. It currently:
 
 - uses the `react` executor
-- uses the `sliding_window` memory provider
-- sets the default model in `agent.yaml` to `openai / gpt-4.1-mini`
+- uses the `session-window/v1` memory provider
+- sets the default model in `agents/<bundle-id>/agent.yaml` to `openai / gpt-4.1-mini`
 - lists all builtin tools explicitly in `manifest.tools`
+- writes a bundle-local `.gitignore` so build artifacts such as `target/` and `node_modules/` stay out of bundle payloads
 - starts with `sandbox.mode: "read_only"`
 - enables bundle-command network access with `sandbox.permissions.network: ["*"]`
 - uses `sandbox.system_tools_mode: "standard"`

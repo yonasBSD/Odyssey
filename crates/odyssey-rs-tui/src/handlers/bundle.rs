@@ -72,13 +72,12 @@ pub async fn switch_bundle(
     stream_handle: &mut Option<JoinHandle<()>>,
     bundle_ref: String,
 ) -> Result<(), String> {
-    let metadata = client
+    client
         .select_bundle(bundle_ref.clone())
         .await
         .map_err(|err| err.to_string())?;
     refresh_bundles(client, app).await?;
     app.set_bundle_ref(bundle_ref.clone());
-    app.set_active_model(metadata.agent_spec.model.name.clone());
     agent::refresh_agents(client, app)
         .await
         .map_err(|err| err.to_string())?;

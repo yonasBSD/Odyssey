@@ -34,6 +34,23 @@ It also defaults to:
 `RuntimeConfig.sandbox_mode_override` is `None` by default. When the CLI or an embedding sets it,
 that override replaces the bundle manifest sandbox mode for execution.
 
+`RuntimeConfig::load()` and the `odyssey-rs` CLI also read `~/.odyssey/config.yml` automatically
+when that file exists. The config file can override runtime defaults such as:
+
+- `cache_root`
+- `session_root`
+- `sandbox_root`
+- `bind_addr`
+- `hub_url`
+- `worker_count`
+- `queue_capacity`
+- `default_model` or the shorthand `model`, `model_provider`, and `model_config`
+- bundle-scoped agent overrides under `bundles."<bundle-ref>".agents."<agent-id>"`
+
+Bundle selectors are resolved against installed bundle identity, not the current working directory.
+For local installs, selectors such as `hello-world@latest`, `hello-world@0.1.0`, and
+`local/hello-world@latest` are all valid.
+
 ## Session Lifecycle
 
 A session is created from a `SessionSpec` that points at an `AgentRef`. During creation, the
@@ -45,7 +62,27 @@ Session records currently store:
 - the bundle reference used to create the session
 - the resolved agent id
 - the chosen model provider, model name, and optional model config
+- the merged session sandbox overlay
 - all completed turns
+
+Session sandbox resolution happens once at session creation with this precedence:
+
+1. bundle manifest sandbox policy
+2. user config `bundles."<bundle-ref>".agents."<agent-id>".sandbox`
+3. explicit `SessionSpec.sandbox`
+4. `RuntimeConfig.sandbox_mode_override` for mode only
+
+That merged session sandbox is persisted with the session, so later turns and restarts use the same
+mounts, env passthrough, and system tool exposure.
+
+Host mount sources from that merged overlay are not materialized by the runtime. Both
+`mounts.read` and `mounts.write` must point to existing host paths before sandbox startup.
+
+Session model resolution uses the same pattern:
+
+1. bundle or agent manifest model
+2. user config `bundles."<bundle-ref>".agents."<agent-id>".model*`
+3. explicit `SessionSpec.model`
 
 Turns are appended after execution completes. The runtime stores either a simple prompt/response
 pair or a normalized chat history that includes tool use and tool result records.
@@ -148,5 +185,45 @@ Cloud model providers are wired up for:
 - Phind
 - xAI
 
-Local provider names such as `llama_cpp` are recognized by the resolver, but local model support
-is not implemented yet.
+Local providers currently wired up for runtime execution are:
+
+- `llama_cpp` (aliases: `llamacpp`, `llama-cpp`) using Hugging Face-hosted GGUF models
+
+Use `model.name` as Odyssey's logical model id and put the Hugging Face source details in
+`model.config`:
+
+```yaml
+default_model:
+  provider: llama_cpp
+  name: qwen3.5-9b-q4
+  config:
+    hf_repo_id: unsloth/Qwen3.5-9B-GGUF
+    hf_filename: Qwen3.5-9B-Q4_0.gguf
+    hf_revision: main
+    max_tokens: 1024
+    temperature: 0.2
+    n_ctx: 4096
+    n_threads: 8
+    n_threads_batch: 8
+    n_gpu_layers: 99
+    reasoning_format: auto
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: true
+```
+
+`config.hf_repo_id` is required. Optional llama.cpp-specific fields include `hf_filename`,
+`hf_mmproj_filename`, `hf_revision`, `model_dir`, `chat_template`, `system_prompt`,
+`force_json_grammar`, `reasoning_format`, `extra_body`, `repeat_penalty`,
+`frequency_penalty`, `presence_penalty`, `repeat_last_n`, `seed`, `n_batch`, `n_ubatch`,
+`main_gpu`, `split_mode`, `use_mlock`, and `devices`.
+
+The first time the runtime resolves a given `llama_cpp` model config it may download model files
+from Hugging Face and initialize the local llama.cpp backend. After that, the runtime keeps the
+provider warm in-process and reuses it across turns and sessions. Private Hugging Face repos can
+use the standard `HUGGINGFACE_TOKEN`, `HF_TOKEN`, or `HUGGINGFACE_HUB_TOKEN` environment
+variables.
+
+For build-time acceleration backends, `odyssey-rs-runtime` exposes `cuda` and `meta` Cargo
+features, and the `odyssey-rs` crate forwards the same feature names. Odyssey's `meta` feature
+maps to the upstream `autoagents-llamacpp` `metal` backend flag.
