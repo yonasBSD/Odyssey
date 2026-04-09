@@ -154,7 +154,7 @@ fn render_session_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
         Line::from(Span::styled(
-            " ─".to_string() + &"─".repeat(70),
+            format!(" ─{}", "─".repeat(70)),
             Style::default().fg(t.border),
         )),
     ];
@@ -385,7 +385,7 @@ fn render_theme_lines(app: &App) -> Vec<Line<'static>> {
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        " ─".to_string() + &"─".repeat(50),
+        format!(" ─{}", "─".repeat(50)),
         Style::default().fg(t.border),
     )));
 

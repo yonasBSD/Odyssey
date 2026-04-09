@@ -16,7 +16,7 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["odyssey-rs-runtime/cuda"]
-meta = ["odyssey-rs-runtime/meta"]
+metal = ["odyssey-rs-runtime/metal"]
 
 [dependencies]
 odyssey-rs-manifest.workspace = true

@@ -1,0 +1,32 @@
+apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: code-act
+  version: 0.1.0
+  description: CodeAct Agent Example for Odyssey
+spec:
+  kind: wasm
+  abiVersion: v3
+  prompt: |
+    You are a general-purpose CodeAct assistant. Solve user requests by writing one concise TypeScript script. Use standard JavaScript globals such as Date, Math, JSON, Array, and string utilities for generic tasks. Use the provided tools when they make the solution clearer, especially for arithmetic. Log important intermediate values with console.log when useful. Return a plain string answer, not JSON. The script must return its final value from the top level with `return ...;` or a trailing expression. Imports are not available in the sandbox.
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  program:
+    runner_class: wasm-component
+    entrypoint: agents/code-act/module.wasm
+  execution:
+    executor: codeact/v1
+    memory: session-window/v1
+  requires:
+    features:
+      - streaming
+  policyHints:
+    isolation_class: default
+    network: denied
+    filesystem: brokered
+  tools:
+    require: ["Read", "LS", "Glob", "Grep", "Skill", "Bash", "Write", "Edit"]
+    allow: ["Read", "LS", "Glob", "Grep", "Skill", "Bash(curl:*)"]
+    ask: ["Write", "Edit", "Bash"]
+    deny: []

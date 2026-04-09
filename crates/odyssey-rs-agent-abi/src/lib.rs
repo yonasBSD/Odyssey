@@ -95,6 +95,8 @@ pub struct HostToolSpec {
     pub name: String,
     pub description: String,
     pub args_schema: Value,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +150,14 @@ mod tests {
                         "path": {"type": "string"}
                     }
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    }
+                })),
             }],
         };
 
@@ -209,5 +219,23 @@ mod tests {
                 bundle_id: "demo".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn host_tool_spec_defaults_missing_output_schema() {
+        let decoded: HostToolSpec = serde_json::from_value(json!({
+            "name": "Read",
+            "description": "Read a text file",
+            "args_schema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"}
+                }
+            }
+        }))
+        .expect("deserialize without output schema");
+
+        assert_eq!(decoded.output_schema, None);
     }
 }

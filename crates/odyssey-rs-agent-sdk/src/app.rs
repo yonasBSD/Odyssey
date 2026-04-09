@@ -6,6 +6,10 @@ use autoagents_core::agent::memory::{MemoryProvider, SlidingWindowMemory};
 use autoagents_core::agent::prebuilt::executor::{
     BasicAgent, BasicAgentOutput, ReActAgent, ReActAgentOutput,
 };
+#[cfg(feature = "codeact")]
+use autoagents_core::agent::prebuilt::executor::{
+    CodeActAgent, CodeActAgentOutput, CodeActSandboxLimits,
+};
 use autoagents_core::agent::{AgentBuilder, AgentDeriveT, AgentHooks, Context, DirectAgent};
 use autoagents_core::tool::{ToolCallResult, ToolT, shared_tools_to_boxes};
 use autoagents_llm::ToolCall;
@@ -29,6 +33,23 @@ impl Default for ReactExecutor {
     fn default() -> Self {
         Self {
             max_turns: DEFAULT_MAX_TURNS,
+        }
+    }
+}
+
+#[cfg(feature = "codeact")]
+#[derive(Debug, Clone)]
+pub struct CodeActExecutor {
+    max_turns: usize,
+    sandbox_limits: Option<CodeActSandboxLimits>,
+}
+
+#[cfg(feature = "codeact")]
+impl Default for CodeActExecutor {
+    fn default() -> Self {
+        Self {
+            max_turns: DEFAULT_MAX_TURNS,
+            sandbox_limits: None,
         }
     }
 }
@@ -75,6 +96,28 @@ impl<A> OdysseyAgentApp<A, ReactExecutor> {
     }
 }
 
+#[cfg(feature = "codeact")]
+impl<A> OdysseyAgentApp<A, CodeActExecutor> {
+    pub fn codeact(agent: A) -> Self {
+        Self {
+            agent,
+            executor: CodeActExecutor::default(),
+            custom_tools: Vec::new(),
+            memory: MemoryConfig::SlidingWindow(DEFAULT_MEMORY_WINDOW),
+        }
+    }
+
+    pub fn max_turns(mut self, max_turns: usize) -> Self {
+        self.executor.max_turns = max_turns.max(1);
+        self
+    }
+
+    pub fn sandbox_limits(mut self, limits: CodeActSandboxLimits) -> Self {
+        self.executor.sandbox_limits = Some(limits);
+        self
+    }
+}
+
 impl<A, E> OdysseyAgentApp<A, E> {
     pub fn tool(mut self, tool: Arc<dyn ToolT>) -> Self {
         self.custom_tools.push(tool);
@@ -109,7 +152,8 @@ impl<A, E> OdysseyAgentApp<A, E> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "wasi"), async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "wasi")), async_trait)]
 pub trait RunnableApp {
     async fn run(self, request: &RunRequest) -> AgentResult<RunResponse>;
 }
@@ -121,7 +165,8 @@ where
     app.run(request).await
 }
 
-#[async_trait]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "wasi"), async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "wasi")), async_trait)]
 impl<A> RunnableApp for OdysseyAgentApp<A, BasicExecutor>
 where
     A: AgentDeriveT + AgentHooks + Send + Sync + 'static,
@@ -148,7 +193,8 @@ where
     }
 }
 
-#[async_trait]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "wasi"), async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "wasi")), async_trait)]
 impl<A> RunnableApp for OdysseyAgentApp<A, ReactExecutor>
 where
     A: AgentDeriveT + AgentHooks + Send + Sync + 'static,
@@ -168,6 +214,40 @@ where
         ))
         .llm(prepared.llm)
         .stream(true);
+        if let Some(memory) = prepared.memory {
+            builder = builder.memory(memory);
+        }
+        let handle = builder
+            .build()
+            .await
+            .map_err(|err| AgentSdkError::Execution(err.to_string()))?;
+        run_handle(handle, request).await
+    }
+}
+
+#[cfg(feature = "codeact")]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "wasi"), async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "wasi")), async_trait)]
+impl<A> RunnableApp for OdysseyAgentApp<A, CodeActExecutor>
+where
+    A: AgentDeriveT + AgentHooks + Send + Sync + 'static,
+    A::Output: Into<String> + From<CodeActAgentOutput>,
+{
+    async fn run(self, request: &RunRequest) -> AgentResult<RunResponse> {
+        let OdysseyAgentApp {
+            agent,
+            executor,
+            custom_tools,
+            memory,
+        } = self;
+        let prepared = prepare_run(agent, custom_tools, memory, request)?;
+        let mut codeact_agent = CodeActAgent::with_max_turns(prepared.agent, executor.max_turns);
+        if let Some(limits) = executor.sandbox_limits {
+            codeact_agent = codeact_agent.with_sandbox_limits(limits);
+        }
+        let mut builder = AgentBuilder::<_, DirectAgent>::new(codeact_agent)
+            .llm(prepared.llm)
+            .stream(true);
         if let Some(memory) = prepared.memory {
             builder = builder.memory(memory);
         }

@@ -30,7 +30,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libasound2-dev pkg-config
+          sudo apt-get install -y \
+            bubblewrap \
+            build-essential \
+            clang \
+            cmake \
+            libasound2-dev \
+            libclang-dev \
+            llvm-dev \
+            ninja-build \
+            pkg-config
 
       - name: Install Rust (via rustup)
         uses: actions-rs/toolchain@v1
@@ -51,7 +60,7 @@ jobs:
             --engine llvm \
             --skip-clean \
             --workspace \
-            --all-features \
+            --no-default-features \
             --timeout 120 \
             --out Xml \
             --ignore-panics \

@@ -26,6 +26,30 @@ impl Tool for BashTool {
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["command"],"properties":{"command":{"type":"string"},"cwd":{"type":"string"}}})
     }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": [
+                "status_code",
+                "stdout",
+                "stderr",
+                "stdout_truncated",
+                "stderr_truncated"
+            ],
+            "properties": {
+                "status_code": {
+                    "anyOf": [
+                        { "type": "integer" },
+                        { "type": "null" }
+                    ]
+                },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "stdout_truncated": { "type": "boolean" },
+                "stderr_truncated": { "type": "boolean" }
+            }
+        }))
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         let input: BashArgs = serde_json::from_value(args)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;

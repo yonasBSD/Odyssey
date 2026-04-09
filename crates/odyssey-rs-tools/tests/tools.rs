@@ -223,6 +223,55 @@ fn builtin_registry_exposes_expected_tools() {
     assert_eq!(specs, names);
 }
 
+#[test]
+fn builtin_specs_expose_output_schemas_for_codeact_bindings() {
+    let registry = builtin_registry();
+    let specs = registry.specs();
+
+    let skill = specs
+        .iter()
+        .find(|spec| spec.name == "Skill")
+        .expect("skill spec");
+    let read = specs
+        .iter()
+        .find(|spec| spec.name == "Read")
+        .expect("read spec");
+
+    assert_eq!(
+        skill
+            .output_schema
+            .as_ref()
+            .and_then(|schema| schema.get("properties")),
+        Some(&json!({
+            "name": { "type": "string" },
+            "content": { "type": "string" },
+            "skills": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name", "description", "path"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        }))
+    );
+    assert_eq!(
+        read.output_schema,
+        Some(json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            }
+        }))
+    );
+}
+
 #[tokio::test]
 async fn authorization_and_command_events_are_recorded() {
     let temp = tempdir().expect("tempdir");

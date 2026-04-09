@@ -23,6 +23,27 @@ impl Tool for SkillTool {
     fn args_schema(&self) -> Value {
         json!({"type":"object","properties":{"name":{"type":"string"}}})
     }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "content": { "type": "string" },
+                "skills": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "description", "path"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "description": { "type": "string" },
+                            "path": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }))
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
         let input: SkillArgs = serde_json::from_value(args)

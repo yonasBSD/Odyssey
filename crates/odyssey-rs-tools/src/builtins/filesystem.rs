@@ -37,6 +37,16 @@ impl Tool for ReadTool {
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}})
     }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            }
+        }))
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
         let input: ReadArgs = serde_json::from_value(args)
@@ -64,6 +74,16 @@ impl Tool for WriteTool {
     }
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}})
+    }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["path", "bytes"],
+            "properties": {
+                "path": { "type": "string" },
+                "bytes": { "type": "integer" }
+            }
+        }))
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
@@ -100,6 +120,16 @@ impl Tool for EditTool {
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["path","old_text","new_text"],"properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}})
     }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["path", "edited"],
+            "properties": {
+                "path": { "type": "string" },
+                "edited": { "type": "boolean" }
+            }
+        }))
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
         let input: EditArgs = serde_json::from_value(args)
@@ -135,6 +165,30 @@ impl Tool for LsTool {
     }
     fn args_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}}})
+    }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["path", "entries"],
+            "properties": {
+                "path": { "type": "string" },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "path", "type"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "path": { "type": "string" },
+                            "type": {
+                                "type": "string",
+                                "enum": ["dir", "file", "other", "symlink"]
+                            }
+                        }
+                    }
+                }
+            }
+        }))
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
@@ -223,6 +277,18 @@ impl Tool for GlobTool {
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string"}}})
     }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["matches"],
+            "properties": {
+                "matches": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            }
+        }))
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;
         let input: GlobArgs = serde_json::from_value(args)
@@ -256,6 +322,26 @@ impl Tool for GrepTool {
     }
     fn args_schema(&self) -> Value {
         json!({"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string"}}})
+    }
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "required": ["matches"],
+            "properties": {
+                "matches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "line", "text"],
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "text": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }))
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
         ctx.authorize_tool(self.name()).await?;

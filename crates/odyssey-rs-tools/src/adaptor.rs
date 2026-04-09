@@ -47,6 +47,10 @@ impl ToolT for ToolAdaptor {
     fn args_schema(&self) -> Value {
         self.tool.args_schema()
     }
+
+    fn output_schema(&self) -> Option<Value> {
+        self.tool.output_schema()
+    }
 }
 
 pub fn tool_to_adaptor(tool: Arc<dyn Tool>, ctx: ToolContext) -> Arc<dyn ToolT> {

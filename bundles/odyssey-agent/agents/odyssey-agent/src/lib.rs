@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use autoagents::core::tool::{ToolCallError, ToolInputT, ToolRuntime, ToolT};
+use autoagents::core::tool::{ToolCallError, ToolRuntime, ToolT};
 use autoagents_derive::{AgentHooks, ToolInput, agent, tool};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

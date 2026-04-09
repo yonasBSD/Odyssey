@@ -12,9 +12,7 @@ readme.workspace = true
 [features]
 default = []
 cuda = ["autoagents-llamacpp/cuda"]
-# `meta` keeps the Odyssey-facing feature name stable while forwarding to the
-# upstream Metal backend flag.
-meta = ["autoagents-llamacpp/metal"]
+metal = ["autoagents-llamacpp/metal"]
 
 [dependencies]
 odyssey-rs-bundle.workspace = true
@@ -24,7 +22,7 @@ odyssey-rs-protocol.workspace = true
 odyssey-rs-tools.workspace = true
 odyssey-rs-sandbox.workspace = true
 
-autoagents-core = { workspace = true }
+autoagents-core = { workspace = true, features = ["codeact"] }
 autoagents-llm = { workspace = true, features = ["openai", "anthropic", "deepseek", "google", "groq", "azure_openai", "openrouter", "xai", "phind", "minimax"] }
 autoagents-llamacpp = { workspace = true , features = ["mtmd"] }
 autoagents-protocol.workspace = true

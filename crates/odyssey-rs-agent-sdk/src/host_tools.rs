@@ -122,6 +122,10 @@ impl ToolT for DynamicHostTool {
     fn args_schema(&self) -> Value {
         self.spec.args_schema.clone()
     }
+
+    fn output_schema(&self) -> Option<Value> {
+        self.spec.output_schema.clone()
+    }
 }
 
 pub struct TypedHostTool<Args> {
@@ -204,6 +208,10 @@ where
     fn args_schema(&self) -> Value {
         self.inner.args_schema()
     }
+
+    fn output_schema(&self) -> Option<Value> {
+        self.inner.output_schema()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +287,14 @@ mod tests {
                             "path": {"type": "string"}
                         }
                     }),
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "required": ["path", "content"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        }
+                    })),
                 },
                 HostToolSpec {
                     name: "Bash".to_string(),
@@ -291,6 +307,17 @@ mod tests {
                             "cwd": {"type": "string"}
                         }
                     }),
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "required": ["status_code", "stdout", "stderr", "stdout_truncated", "stderr_truncated"],
+                        "properties": {
+                            "status_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                            "stdout": {"type": "string"},
+                            "stderr": {"type": "string"},
+                            "stdout_truncated": {"type": "boolean"},
+                            "stderr_truncated": {"type": "boolean"}
+                        }
+                    })),
                 },
             ],
         }
@@ -322,6 +349,17 @@ mod tests {
                 }
             })
         );
+        assert_eq!(
+            read.output_schema(),
+            Some(json!({
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                }
+            }))
+        );
         assert!(catalog.write().is_none());
 
         let _ = ReadArgs {
@@ -337,5 +375,6 @@ mod tests {
         assert_eq!(tool.name(), "Read");
         assert_eq!(tool.description(), "Read a text file");
         assert_eq!(tool.args_schema(), spec.args_schema);
+        assert_eq!(tool.output_schema(), spec.output_schema);
     }
 }

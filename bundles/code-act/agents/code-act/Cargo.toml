@@ -1,0 +1,16 @@
+[package]
+name = "odyssey-rs-code-act-agent-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+autoagents = { workspace = true, features = ["codeact"] }
+autoagents-derive = { workspace = true }
+odyssey-rs-agent-sdk = {workspace = true, features = ["codeact"] }
+serde_json = "1"
+wit-bindgen = "0.51.0"
+serde = { workspace = true }

@@ -35,7 +35,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap cmake libasound2-dev pkg-config
+          sudo apt-get install -y \
+            bubblewrap \
+            build-essential \
+            clang \
+            cmake \
+            libasound2-dev \
+            libclang-dev \
+            llvm-dev \
+            ninja-build \
+            pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,10 +58,10 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - name: Run tests
-        run: cargo test --workspace --all-features --all-targets 
+        run: cargo test --workspace --all-targets
 
       - name: Run cargo check
-        run: cargo check --all-targets --all-features
+        run: cargo check --workspace --all-targets --no-default-features
 
   multi_os:
     name: Multi-OS build
@@ -79,7 +88,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap pkg-config libasound2-dev
+          sudo apt-get install -y \
+            bubblewrap \
+            build-essential \
+            clang \
+            cmake \
+            libasound2-dev \
+            libclang-dev \
+            llvm-dev \
+            ninja-build \
+            pkg-config
 
       - name: Build Workspace
         run: cargo build --workspace --release

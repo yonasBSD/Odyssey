@@ -48,7 +48,11 @@ wit_bindgen::generate!({
 mod app;
 mod host_tools;
 
+#[cfg(feature = "codeact")]
+pub use app::CodeActExecutor;
 pub use app::{AutoAgentApp, BasicExecutor, OdysseyAgentApp, ReactExecutor, RunnableApp, run_app};
+#[cfg(feature = "codeact")]
+pub use autoagents_core::agent::prebuilt::executor::CodeActSandboxLimits;
 pub use host_tools::{
     BashArgs, DynamicHostTool, EditArgs, GlobArgs, GrepArgs, HostToolCatalog, LsArgs, ReadArgs,
     SkillArgs, TypedHostTool, WriteArgs,
@@ -478,7 +482,15 @@ pub fn block_on_future<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    futures::executor::block_on(future)
+    #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+    {
+        autoagents_core::utils::block_on_local_executor(future)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+    {
+        futures::executor::block_on(future)
+    }
 }
 
 #[macro_export]

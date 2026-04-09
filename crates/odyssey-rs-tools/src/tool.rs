@@ -8,6 +8,7 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub args_schema: Value,
+    pub output_schema: Option<Value>,
 }
 
 #[async_trait]
@@ -15,6 +16,9 @@ pub trait Tool: Send + Sync + Debug {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn args_schema(&self) -> Value;
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<Value, ToolError>;
 
     fn spec(&self) -> ToolSpec {
@@ -22,6 +26,7 @@ pub trait Tool: Send + Sync + Debug {
             name: self.name().to_string(),
             description: self.description().to_string(),
             args_schema: self.args_schema(),
+            output_schema: self.output_schema(),
         }
     }
 }

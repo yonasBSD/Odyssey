@@ -1,19 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/odyssey-rs",
-    "crates/odyssey-rs-agent-abi",
-    "crates/odyssey-rs-agent-sdk",
-    "crates/odyssey-rs-manifest",
-    "crates/odyssey-rs-bundle",
-    "crates/odyssey-rs-protocol",
-    "crates/odyssey-rs-runtime",
-    "crates/odyssey-rs-tools",
-    "crates/odyssey-rs-sandbox",
-    "crates/odyssey-rs-server",
-    "crates/odyssey-rs-tui",
+    "crates/*",
     "examples/*",
-    "bundles/odyssey-agent/agents/odyssey-agent"
+    "bundles/odyssey-agent/agents/odyssey-agent",
+    "bundles/code-act/agents/code-act"
 ]
 
 default-members = ["crates/odyssey-rs"]

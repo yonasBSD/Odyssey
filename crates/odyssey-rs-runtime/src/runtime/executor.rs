@@ -164,6 +164,7 @@ impl ScheduleExecutor {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 args_schema: tool.args_schema(),
+                output_schema: tool.output_schema(),
             })
             .collect::<Vec<_>>();
         info!("Prepared Tool Context");

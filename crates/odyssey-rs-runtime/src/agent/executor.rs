@@ -1,5 +1,5 @@
 use crate::RuntimeError;
-use autoagents_core::agent::prebuilt::executor::ReActAgent;
+use autoagents_core::agent::prebuilt::executor::{CodeActAgent, ReActAgent};
 use autoagents_core::agent::{
     AgentBuilder, AgentDeriveT, AgentHooks, Context, DirectAgent, HookOutcome, task::Task,
 };
@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use log::info;
 use odyssey_rs_protocol::{AutoAgentsEvent, AutoAgentsStreamChunk};
-use odyssey_rs_protocol::{EventMsg, EventPayload, TurnContext};
+use odyssey_rs_protocol::{EventMsg, EventPayload, ExecStream, TurnContext};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,6 +33,7 @@ pub struct ExecutorRun {
 pub async fn run_executor(run: ExecutorRun) -> Result<String, RuntimeError> {
     match run.executor_id.as_str() {
         "react" | "react/v1" => run_react(run).await,
+        "codeact" | "codeact/v1" => run_codeact(run).await,
         other => Err(RuntimeError::Unsupported(format!(
             "unsupported prebuilt executor: {other}"
         ))),
@@ -45,6 +46,70 @@ async fn run_react(run: ExecutorRun) -> Result<String, RuntimeError> {
     let mut builder = AgentBuilder::<ReActAgent<OdysseyAgent>, DirectAgent>::new(agent)
         .llm(run.llm)
         .stream(true);
+    if let Some(memory) = run.memory {
+        builder = builder.memory(memory);
+    }
+    let mut handle = builder
+        .build()
+        .await
+        .map_err(|err| RuntimeError::Executor(err.to_string()))?;
+    info!("Built Agent instance");
+    let events = handle.subscribe_events();
+    let event_task = tokio::spawn(forward_autoagents_events(
+        events,
+        run.sender.clone(),
+        run.session_id,
+        run.turn_id,
+        run.turn_context.clone(),
+    ));
+    let task = run.task.with_system_prompt(run.system_prompt);
+    info!("Running agent with streaming");
+    let stream = match handle.agent.run_stream(task).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            event_task.abort();
+            return Err(RuntimeError::Executor(err.to_string()));
+        }
+    };
+    let mut response = String::default();
+    {
+        tokio::pin!(stream);
+        while let Some(output) = stream.next().await {
+            match output {
+                Ok(output) => response = output,
+                Err(err) => {
+                    event_task.abort();
+                    return Err(RuntimeError::Executor(err.to_string()));
+                }
+            }
+        }
+    }
+    drop(handle);
+    match event_task.await {
+        Ok(()) => {}
+        Err(err) => {
+            return Err(RuntimeError::Executor(format!(
+                "failed to forward autoagents events: {err}"
+            )));
+        }
+    }
+    emit(
+        &run.sender,
+        run.session_id,
+        EventPayload::TurnCompleted {
+            turn_id: run.turn_id,
+            message: response.clone(),
+        },
+    );
+    Ok(response)
+}
+
+async fn run_codeact(run: ExecutorRun) -> Result<String, RuntimeError> {
+    info!("Running CodeAct Executor");
+    let agent: CodeActAgent<OdysseyAgent> =
+        CodeActAgent::new(OdysseyAgent::new(run.system_prompt.clone(), run.tools));
+    let mut builder: AgentBuilder<CodeActAgent<OdysseyAgent>, DirectAgent> =
+        AgentBuilder::new(agent).llm(run.llm).stream(true);
     if let Some(memory) = run.memory {
         builder = builder.memory(memory);
     }
@@ -132,6 +197,7 @@ pub(crate) struct AutoagentsEventBridge {
     turn_id: Uuid,
     turn_context: TurnContext,
     reasoning_open: bool,
+    execution_ids: HashMap<String, Uuid>,
     tool_index_ids: HashMap<usize, String>,
     tool_call_ids: HashMap<String, Uuid>,
     started_tool_calls: HashSet<Uuid>,
@@ -143,6 +209,7 @@ impl AutoagentsEventBridge {
             turn_id,
             turn_context,
             reasoning_open: false,
+            execution_ids: HashMap::new(),
             tool_index_ids: HashMap::new(),
             tool_call_ids: HashMap::new(),
             started_tool_calls: HashSet::new(),
@@ -181,6 +248,48 @@ impl AutoagentsEventBridge {
             },
             AutoAgentsEvent::ToolCallFailed { id, error, .. } => MappedEvent {
                 payloads: self.map_tool_call_finished(id, json!({ "error": error }), false),
+                terminal: false,
+            },
+            AutoAgentsEvent::CodeExecutionStarted {
+                execution_id,
+                language,
+                ..
+            } => MappedEvent {
+                payloads: self.map_code_execution_started(execution_id, language),
+                terminal: false,
+            },
+            AutoAgentsEvent::CodeExecutionConsole {
+                execution_id,
+                message,
+                ..
+            } => MappedEvent {
+                payloads: self.map_code_execution_console(execution_id, message),
+                terminal: false,
+            },
+            AutoAgentsEvent::CodeExecutionCompleted {
+                execution_id,
+                result,
+                ..
+            } => MappedEvent {
+                payloads: self.map_code_execution_finished(
+                    execution_id,
+                    Some(stringify_exec_output(result)),
+                    0,
+                    ExecStream::Stdout,
+                ),
+                terminal: false,
+            },
+            AutoAgentsEvent::CodeExecutionFailed {
+                execution_id,
+                error,
+                ..
+            } => MappedEvent {
+                payloads: self.map_code_execution_finished(
+                    execution_id,
+                    Some(error),
+                    1,
+                    ExecStream::Stderr,
+                ),
                 terminal: false,
             },
             AutoAgentsEvent::TaskError { error, .. } => {
@@ -333,6 +442,63 @@ impl AutoagentsEventBridge {
         payloads
     }
 
+    fn map_code_execution_started(
+        &mut self,
+        raw_execution_id: String,
+        language: String,
+    ) -> Vec<EventPayload> {
+        let mut payloads = self.close_reasoning_section();
+        let exec_id = self.execution_id(&raw_execution_id);
+        payloads.push(EventPayload::ExecCommandBegin {
+            turn_id: self.turn_id,
+            exec_id,
+            command: vec!["codeact".to_string(), language],
+            cwd: self.turn_context.cwd.clone(),
+        });
+        payloads
+    }
+
+    fn map_code_execution_console(
+        &mut self,
+        raw_execution_id: String,
+        message: String,
+    ) -> Vec<EventPayload> {
+        let mut payloads = self.close_reasoning_section();
+        payloads.push(EventPayload::ExecCommandOutputDelta {
+            turn_id: self.turn_id,
+            exec_id: self.execution_id(&raw_execution_id),
+            stream: ExecStream::Stdout,
+            delta: message,
+        });
+        payloads
+    }
+
+    fn map_code_execution_finished(
+        &mut self,
+        raw_execution_id: String,
+        output: Option<String>,
+        exit_code: i32,
+        stream: ExecStream,
+    ) -> Vec<EventPayload> {
+        let mut payloads = self.close_reasoning_section();
+        let exec_id = self.execution_id(&raw_execution_id);
+        if let Some(delta) = output.filter(|delta| !delta.is_empty()) {
+            payloads.push(EventPayload::ExecCommandOutputDelta {
+                turn_id: self.turn_id,
+                exec_id,
+                stream,
+                delta,
+            });
+        }
+        payloads.push(EventPayload::ExecCommandEnd {
+            turn_id: self.turn_id,
+            exec_id,
+            exit_code,
+        });
+        self.execution_ids.remove(&raw_execution_id);
+        payloads
+    }
+
     fn close_reasoning_section(&mut self) -> Vec<EventPayload> {
         if self.reasoning_open {
             self.reasoning_open = false;
@@ -347,6 +513,13 @@ impl AutoagentsEventBridge {
         *self
             .tool_call_ids
             .entry(raw_tool_call_id.to_string())
+            .or_insert_with(Uuid::new_v4)
+    }
+
+    fn execution_id(&mut self, raw_execution_id: &str) -> Uuid {
+        *self
+            .execution_ids
+            .entry(raw_execution_id.to_string())
             .or_insert_with(Uuid::new_v4)
     }
 }
@@ -412,6 +585,13 @@ fn parse_json_value(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
+fn stringify_exec_output(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        other => other.to_string(),
+    }
+}
+
 pub fn emit(sender: &broadcast::Sender<EventMsg>, session_id: Uuid, payload: EventPayload) {
     let _ = sender.send(EventMsg {
         id: Uuid::new_v4(),
@@ -425,7 +605,7 @@ pub fn emit(sender: &broadcast::Sender<EventMsg>, session_id: Uuid, payload: Eve
 mod tests {
     use super::{AutoagentsEventBridge, emit, parse_json_value};
     use odyssey_rs_protocol::{AutoAgentsEvent, AutoAgentsStreamChunk};
-    use odyssey_rs_protocol::{EventPayload, TurnContext};
+    use odyssey_rs_protocol::{EventPayload, ExecStream, TurnContext};
     use pretty_assertions::assert_eq;
     use serde_json::{Value, json};
     use tokio::sync::broadcast;
@@ -631,6 +811,131 @@ mod tests {
             &failed.payloads[0],
             EventPayload::ToolCallFinished { success, result, .. }
                 if !success && result == &json!({ "error": "boom" })
+        ));
+    }
+
+    #[test]
+    fn code_execution_events_map_to_exec_payloads() {
+        let turn_id = Uuid::new_v4();
+        let context = TurnContext {
+            cwd: Some("/workspace".to_string()),
+            ..TurnContext::default()
+        };
+        let mut bridge = AutoagentsEventBridge::new(turn_id, context.clone());
+
+        let started = bridge.map_event(AutoAgentsEvent::CodeExecutionStarted {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            execution_id: "exec_1".to_string(),
+            language: "typescript".to_string(),
+            source: "return 42;".to_string(),
+        });
+        let console = bridge.map_event(AutoAgentsEvent::CodeExecutionConsole {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            execution_id: "exec_1".to_string(),
+            message: "console.log(42)".to_string(),
+        });
+        let completed = bridge.map_event(AutoAgentsEvent::CodeExecutionCompleted {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            execution_id: "exec_1".to_string(),
+            result: json!(42),
+            duration_ms: 7,
+        });
+
+        let started_id = match &started.payloads[0] {
+            EventPayload::ExecCommandBegin {
+                turn_id: id,
+                exec_id,
+                command,
+                cwd,
+            } => {
+                assert_eq!(*id, turn_id);
+                assert_eq!(
+                    command,
+                    &vec!["codeact".to_string(), "typescript".to_string()]
+                );
+                assert_eq!(cwd, &context.cwd);
+                *exec_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        let console_id = match &console.payloads[0] {
+            EventPayload::ExecCommandOutputDelta {
+                turn_id: id,
+                exec_id,
+                stream,
+                delta,
+            } => {
+                assert_eq!(*id, turn_id);
+                assert!(matches!(stream, ExecStream::Stdout));
+                assert_eq!(delta, "console.log(42)");
+                *exec_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        let result_id = match &completed.payloads[0] {
+            EventPayload::ExecCommandOutputDelta {
+                turn_id: id,
+                exec_id,
+                stream,
+                delta,
+            } => {
+                assert_eq!(*id, turn_id);
+                assert!(matches!(stream, ExecStream::Stdout));
+                assert_eq!(delta, "42");
+                *exec_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        let finished_id = match &completed.payloads[1] {
+            EventPayload::ExecCommandEnd {
+                turn_id: id,
+                exec_id,
+                exit_code,
+            } => {
+                assert_eq!(*id, turn_id);
+                assert_eq!(*exit_code, 0);
+                *exec_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+
+        assert_eq!(started_id, console_id);
+        assert_eq!(console_id, result_id);
+        assert_eq!(result_id, finished_id);
+    }
+
+    #[test]
+    fn code_execution_failure_maps_to_stderr_and_non_zero_exit() {
+        let turn_id = Uuid::new_v4();
+        let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
+
+        let failed = bridge.map_event(AutoAgentsEvent::CodeExecutionFailed {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            execution_id: "exec_2".to_string(),
+            error: "sandbox failure".to_string(),
+            duration_ms: 11,
+        });
+
+        assert!(matches!(
+            &failed.payloads[0],
+            EventPayload::ExecCommandOutputDelta {
+                turn_id: id,
+                stream: ExecStream::Stderr,
+                delta,
+                ..
+            } if *id == turn_id && delta == "sandbox failure"
+        ));
+        assert!(matches!(
+            &failed.payloads[1],
+            EventPayload::ExecCommandEnd {
+                turn_id: id,
+                exit_code: 1,
+                ..
+            } if *id == turn_id
         ));
     }
 

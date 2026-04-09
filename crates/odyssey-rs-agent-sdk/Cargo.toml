@@ -9,6 +9,10 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+default = []
+codeact = ["autoagents-core/codeact"]
+
 [dependencies]
 odyssey-rs-agent-abi.workspace = true
 async-trait.workspace = true
