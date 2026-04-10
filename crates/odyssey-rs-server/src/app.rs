@@ -39,11 +39,14 @@ pub async fn serve(config: RuntimeConfig) -> Result<(), RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_app;
+    use super::{build_app, serve};
     use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::{
+        Method, Request, StatusCode,
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
+    };
     use odyssey_rs_protocol::{DEFAULT_HUB_URL, SandboxMode};
-    use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
+    use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig, RuntimeError};
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -81,5 +84,43 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn app_builder_registers_permissive_cors_for_preflight_requests() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime"));
+        let app = build_app(runtime);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/bundles")
+                    .header(ORIGIN, "https://example.com")
+                    .header(ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"*".parse().expect("header value"))
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_returns_io_error_for_invalid_bind_address() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = runtime_config(temp.path());
+        config.bind_addr = "not-a-socket-address".to_string();
+
+        let error = serve(config).await.expect_err("invalid bind should fail");
+
+        assert!(matches!(error, RuntimeError::Io { .. }));
+        assert!(error.to_string().contains("not-a-socket-address"));
     }
 }

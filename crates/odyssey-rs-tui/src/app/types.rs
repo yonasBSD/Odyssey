@@ -5,7 +5,7 @@ use ratatui::style::Color;
 use uuid::Uuid;
 
 /// Chat roles displayed in the UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatRole {
     /// User message.
     User,

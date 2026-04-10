@@ -510,6 +510,8 @@ fn find_gpu_temp(components: &Components) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::DRACULA;
+    use pretty_assertions::assert_eq;
 
     fn make_app() -> App {
         App::default()
@@ -641,5 +643,181 @@ mod tests {
         app.close_viewer();
         assert!(app.viewer.is_none());
         assert_eq!(app.viewer_scroll, 0);
+    }
+
+    #[test]
+    fn set_bundles_tracks_active_reference_and_clamps_selection() {
+        let mut app = make_app();
+        app.bundle_ref = "team/demo@1.2.3".to_string();
+        app.selected_bundle = 10;
+        app.set_bundles(vec![
+            BundleInstallSummary {
+                namespace: "team".to_string(),
+                id: "demo".to_string(),
+                version: "1.2.3".to_string(),
+                path: "/workspace/demo".into(),
+            },
+            BundleInstallSummary {
+                namespace: "team".to_string(),
+                id: "other".to_string(),
+                version: "2.0.0".to_string(),
+                path: "/workspace/other".into(),
+            },
+        ]);
+        assert_eq!(app.selected_bundle, 0);
+
+        app.selected_bundle = 5;
+        app.bundle_ref = "missing/ref@0.0.1".to_string();
+        app.set_bundles(vec![BundleInstallSummary {
+            namespace: "team".to_string(),
+            id: "demo".to_string(),
+            version: "1.2.3".to_string(),
+            path: "/workspace/demo".into(),
+        }]);
+        assert_eq!(app.selected_bundle, 0);
+    }
+
+    #[test]
+    fn select_session_only_changes_when_target_exists() {
+        let mut app = make_app();
+        let first = Uuid::new_v4();
+        app.sessions = vec![SessionSummary {
+            id: first,
+            agent_id: "agent-a".into(),
+            message_count: 0,
+            created_at: chrono::Utc::now(),
+        }];
+
+        app.select_session(Uuid::new_v4());
+        assert_eq!(app.selected_session, 0);
+
+        app.select_session(first);
+        assert_eq!(app.selected_session, 0);
+    }
+
+    #[test]
+    fn set_bundle_ref_clears_session_scoped_state() {
+        let mut app = make_app();
+        app.active_session = Some(Uuid::new_v4());
+        app.active_agent = Some("agent-a".to_string());
+        app.agents = vec!["agent-a".to_string()];
+        app.sessions = vec![SessionSummary {
+            id: Uuid::new_v4(),
+            agent_id: "agent-a".into(),
+            message_count: 1,
+            created_at: chrono::Utc::now(),
+        }];
+        app.skills = vec![SkillSummary {
+            name: "repo-hygiene".to_string(),
+            description: "Keep things tidy".to_string(),
+            path: "skills/repo-hygiene".into(),
+        }];
+        app.models = vec!["gpt-4.1-mini".to_string()];
+        app.messages.push(ChatEntry {
+            role: ChatRole::Assistant,
+            content: "hello".to_string(),
+            color: None,
+        });
+        app.pending_permissions.push_back(PendingPermission {
+            request_id: Uuid::new_v4(),
+            summary: "permission".to_string(),
+        });
+        app.streamed_turns.insert(Uuid::new_v4());
+        app.scroll = 3;
+        app.auto_scroll = false;
+        app.chat_max_scroll = 7;
+
+        app.set_bundle_ref("local/new@0.1.0".to_string());
+
+        assert_eq!(app.bundle_ref, "local/new@0.1.0");
+        assert!(app.active_session.is_none());
+        assert!(app.active_agent.is_none());
+        assert!(app.agents.is_empty());
+        assert!(app.sessions.is_empty());
+        assert!(app.skills.is_empty());
+        assert!(app.models.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.pending_permissions.is_empty());
+        assert!(app.streamed_turns.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert!(app.auto_scroll);
+        assert_eq!(app.chat_max_scroll, 0);
+    }
+
+    #[test]
+    fn setters_and_message_loaders_update_state_consistently() {
+        let mut app = make_app();
+        app.set_skills(vec![SkillSummary {
+            name: "repo-hygiene".to_string(),
+            description: "Keep things tidy".to_string(),
+            path: "skills/repo-hygiene".into(),
+        }]);
+        app.set_user_name("vishwak".to_string());
+        app.agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        app.set_active_agent("agent-b".to_string());
+        app.load_messages(vec![
+            Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "hello".to_string(),
+            },
+            Message {
+                role: Role::System,
+                content: "system".to_string(),
+            },
+        ]);
+
+        assert_eq!(app.skills.len(), 1);
+        assert_eq!(app.user_name, "vishwak");
+        assert_eq!(app.active_agent.as_deref(), Some("agent-b"));
+        assert_eq!(app.selected_agent, 1);
+        assert_eq!(
+            app.messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::User, ChatRole::Assistant, ChatRole::System]
+        );
+        assert_eq!(app.scroll, 0);
+        assert!(app.auto_scroll);
+        assert_eq!(app.chat_max_scroll, 0);
+        assert!(app.streamed_turns.is_empty());
+    }
+
+    #[test]
+    fn system_and_permission_messages_use_auto_scroll_and_colors() {
+        let mut app = make_app();
+        app.chat_max_scroll = 12;
+        app.auto_scroll = true;
+
+        app.push_system_message("system".to_string());
+        app.push_system_message_colored("warning".to_string(), ratatui::style::Color::Red);
+        app.push_permission_message("approve?".to_string());
+
+        assert_eq!(app.scroll, 12);
+        assert_eq!(app.messages.len(), 3);
+        assert_eq!(app.messages[0].role, ChatRole::System);
+        assert_eq!(app.messages[1].color, Some(ratatui::style::Color::Red));
+        assert_eq!(app.messages[2].role, ChatRole::Permission);
+        assert!(app.messages[2].color.is_some());
+
+        app.auto_scroll = false;
+        app.scroll = 1;
+        app.push_system_message("stay put".to_string());
+        assert_eq!(app.scroll, 1);
+    }
+
+    #[test]
+    fn theme_initialization_matches_names_case_insensitively() {
+        let mut app = make_app();
+        app.init_theme("DrAcUlA");
+        assert_eq!(app.theme, DRACULA);
+        assert_eq!(app.selected_theme, 2);
+
+        app.maybe_enable_auto_scroll();
+        assert_eq!(app.scroll, app.chat_max_scroll);
     }
 }

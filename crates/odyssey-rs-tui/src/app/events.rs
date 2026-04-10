@@ -197,6 +197,21 @@ fn format_permission_request(request: &PermissionRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use odyssey_rs_protocol::{
+        ApprovalDecision, EventMsg, EventPayload, ExecStream, PathAccess, PermissionAction,
+        PermissionRequest,
+    };
+    use uuid::Uuid;
+
+    fn event(payload: EventPayload) -> EventMsg {
+        EventMsg {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            payload,
+        }
+    }
 
     #[test]
     fn append_assistant_delta_accumulates_into_last_entry() {
@@ -244,5 +259,179 @@ mod tests {
 
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].content, "final");
+    }
+
+    #[test]
+    fn apply_event_finalizes_streamed_turns_and_keeps_non_empty_completions() {
+        let mut app = App::default();
+        let turn_id = Uuid::new_v4();
+        app.streamed_turns.insert(turn_id);
+        app.append_assistant_delta("draft".into());
+        app.status = "running".to_string();
+
+        app.apply_event(event(EventPayload::TurnCompleted {
+            turn_id,
+            message: "final answer".to_string(),
+        }));
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "final answer");
+        assert_eq!(app.status, "idle");
+
+        app.apply_event(event(EventPayload::TurnCompleted {
+            turn_id: Uuid::new_v4(),
+            message: "second answer".to_string(),
+        }));
+
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[1].content, "second answer");
+    }
+
+    #[test]
+    fn apply_event_records_tool_exec_and_error_messages() {
+        let mut app = App::default();
+        let turn_id = Uuid::new_v4();
+        let tool_call_id = Uuid::new_v4();
+        let exec_id = Uuid::new_v4();
+
+        app.apply_event(event(EventPayload::ToolCallStarted {
+            turn_id,
+            tool_call_id,
+            tool_name: "Read".to_string(),
+            arguments: serde_json::json!({ "path": "README.md" }),
+        }));
+        app.apply_event(event(EventPayload::ToolCallFinished {
+            turn_id,
+            tool_call_id,
+            result: serde_json::json!({ "content": "hello" }),
+            success: true,
+        }));
+        app.apply_event(event(EventPayload::ExecCommandBegin {
+            turn_id,
+            exec_id,
+            command: vec!["printf".to_string(), "ok".to_string()],
+            cwd: Some("/workspace".to_string()),
+        }));
+        app.apply_event(event(EventPayload::ExecCommandOutputDelta {
+            turn_id,
+            exec_id,
+            stream: ExecStream::Stdout,
+            delta: "output line".to_string(),
+        }));
+        app.apply_event(event(EventPayload::Error {
+            turn_id: Some(turn_id),
+            message: "tool failed".to_string(),
+        }));
+        app.apply_event(event(EventPayload::ExecCommandEnd {
+            turn_id,
+            exec_id,
+            exit_code: 0,
+        }));
+
+        let contents = app
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec![
+                r#"tool start: Read {"path":"README.md"}"#.to_string(),
+                format!("tool finished (ok): {tool_call_id}"),
+                "exec: printf ok".to_string(),
+                "exec output: output line".to_string(),
+                "error: tool failed".to_string(),
+            ]
+        );
+        assert_eq!(app.status, "idle");
+    }
+
+    #[test]
+    fn apply_event_tracks_permission_queue_and_resolutions() {
+        let mut app = App::default();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        app.apply_event(event(EventPayload::PermissionRequested {
+            turn_id,
+            request_id,
+            action: PermissionAction::Ask,
+            request: PermissionRequest::Path {
+                path: "/workspace/project/data.txt".to_string(),
+                mode: PathAccess::Write,
+            },
+        }));
+
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(
+            app.pending_permissions[0].summary,
+            "Path access requested: /workspace/project/data.txt (Write)"
+        );
+        assert_eq!(
+            app.messages.last().expect("permission message").content,
+            "permission requested: Path access requested: /workspace/project/data.txt (Write) (y=allow once, a=allow always, n=deny)"
+        );
+
+        app.apply_event(event(EventPayload::ApprovalResolved {
+            turn_id,
+            request_id,
+            decision: ApprovalDecision::AllowAlways,
+        }));
+
+        assert!(app.pending_permissions.is_empty());
+        assert_eq!(
+            app.messages.last().expect("approval message").content,
+            "permission resolved: AllowAlways"
+        );
+    }
+
+    #[test]
+    fn apply_event_ignores_empty_exec_output_and_blank_turn_messages() {
+        let mut app = App::default();
+        let turn_id = Uuid::new_v4();
+        let exec_id = Uuid::new_v4();
+
+        app.apply_event(event(EventPayload::ExecCommandOutputDelta {
+            turn_id,
+            exec_id,
+            stream: ExecStream::Stderr,
+            delta: "   ".to_string(),
+        }));
+        app.apply_event(event(EventPayload::TurnCompleted {
+            turn_id,
+            message: "   ".to_string(),
+        }));
+
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn format_permission_request_formats_supported_variants() {
+        assert_eq!(
+            format_permission_request(&PermissionRequest::Tool {
+                name: "Read".to_string(),
+            }),
+            "Tool usage requested: Read"
+        );
+        assert_eq!(
+            format_permission_request(&PermissionRequest::Path {
+                path: "/workspace".to_string(),
+                mode: PathAccess::Read,
+            }),
+            "Path access requested: /workspace (Read)"
+        );
+        assert_eq!(
+            format_permission_request(&PermissionRequest::ExternalPath {
+                path: "/etc/passwd".to_string(),
+                mode: PathAccess::Execute,
+            }),
+            "External path access requested: /etc/passwd (Execute)"
+        );
+        assert_eq!(
+            format_permission_request(&PermissionRequest::Command {
+                argv: vec!["git".to_string(), "status".to_string()],
+            }),
+            "Command execution requested: git status"
+        );
     }
 }

@@ -795,6 +795,55 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_tool_call_start_emits_delta_after_initial_start() {
+        let turn_id = Uuid::new_v4();
+        let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
+
+        let first = bridge.map_event(AutoAgentsEvent::StreamToolCall {
+            sub_id: Uuid::new_v4(),
+            tool_call: json!({
+                "id": "call_4",
+                "function": {
+                    "name": "search",
+                    "arguments": "{\"q\":\"rust\"}"
+                }
+            }),
+        });
+        let second = bridge.map_event(AutoAgentsEvent::ToolCallRequested {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            id: "call_4".to_string(),
+            tool_name: "search".to_string(),
+            arguments: "{\"page\":2}".to_string(),
+        });
+
+        let started_id = match &first.payloads[0] {
+            EventPayload::ToolCallStarted {
+                tool_call_id,
+                arguments,
+                ..
+            } => {
+                assert_eq!(arguments, &json!({ "q": "rust" }));
+                *tool_call_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        let delta_id = match &second.payloads[0] {
+            EventPayload::ToolCallDelta {
+                tool_call_id,
+                delta,
+                ..
+            } => {
+                assert_eq!(delta, &json!({ "page": 2 }));
+                *tool_call_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+
+        assert_eq!(started_id, delta_id);
+    }
+
+    #[test]
     fn tool_call_failed_marks_unsuccessful_completion() {
         let turn_id = Uuid::new_v4();
         let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
@@ -940,6 +989,30 @@ mod tests {
     }
 
     #[test]
+    fn code_execution_completion_omits_empty_stdout_delta() {
+        let turn_id = Uuid::new_v4();
+        let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
+
+        let completed = bridge.map_event(AutoAgentsEvent::CodeExecutionCompleted {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            execution_id: "exec_3".to_string(),
+            result: json!(""),
+            duration_ms: 3,
+        });
+
+        assert_eq!(completed.payloads.len(), 1);
+        assert!(matches!(
+            &completed.payloads[0],
+            EventPayload::ExecCommandEnd {
+                turn_id: id,
+                exit_code: 0,
+                ..
+            } if *id == turn_id
+        ));
+    }
+
+    #[test]
     fn task_error_closes_reasoning_and_terminates_bridge() {
         let turn_id = Uuid::new_v4();
         let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
@@ -963,6 +1036,30 @@ mod tests {
             &errored.payloads[1],
             EventPayload::Error { turn_id: Some(id), message }
                 if *id == turn_id && message == "failed"
+        ));
+    }
+
+    #[test]
+    fn task_complete_closes_reasoning_and_terminates_bridge() {
+        let turn_id = Uuid::new_v4();
+        let mut bridge = AutoagentsEventBridge::new(turn_id, TurnContext::default());
+        let _ = bridge.map_event(AutoAgentsEvent::StreamChunk {
+            sub_id: Uuid::new_v4(),
+            chunk: AutoAgentsStreamChunk::ReasoningContent("plan".to_string()),
+        });
+
+        let completed = bridge.map_event(AutoAgentsEvent::TaskComplete {
+            sub_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            actor_name: "demo".to_string(),
+            result: "done".to_string(),
+        });
+
+        assert!(completed.terminal);
+        assert_eq!(completed.payloads.len(), 1);
+        assert!(matches!(
+            &completed.payloads[0],
+            EventPayload::ReasoningSectionBreak { turn_id: id } if *id == turn_id
         ));
     }
 

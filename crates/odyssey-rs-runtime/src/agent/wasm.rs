@@ -381,3 +381,630 @@ fn render_output(output_json: String) -> String {
         Err(_) => output_json,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ComponentHost, execute_component, from_component_descriptor, render_output,
+        resolve_module_path, validate_descriptor,
+    };
+    use async_trait::async_trait;
+    use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
+    use autoagents_llm::chat::{
+        ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, StructuredOutputFormat,
+        Tool,
+    };
+    use autoagents_llm::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use autoagents_llm::embedding::EmbeddingProvider;
+    use autoagents_llm::error::LLMError;
+    use autoagents_llm::models::{ModelListRequest, ModelListResponse, ModelsProvider};
+    use autoagents_llm::{FunctionCall, LLMProvider, ToolCall};
+    use autoagents_protocol::Event as AutoAgentsEvent;
+    use odyssey_rs_agent_abi::{
+        ABI_VERSION, AgentDescriptor, HostToolCallRequest, HostToolCallResponse,
+        HostToolDefinition, LlmChatRequest, LlmChatResponse, RUNNER_CLASS, json_to_string,
+        string_to_json,
+    };
+    use odyssey_rs_protocol::{EventPayload, TurnContext};
+    use pretty_assertions::assert_eq;
+    use serde_json::{Value, json};
+    use std::fmt;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
+
+    #[derive(Clone, Debug)]
+    struct LlmInvocation {
+        messages_json: String,
+        tool_names: Vec<String>,
+        output_schema: Option<StructuredOutputFormat>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingLlmProvider {
+        calls: Arc<Mutex<Vec<LlmInvocation>>>,
+        error: Option<String>,
+        text: String,
+        reasoning: String,
+        tool_calls: Vec<ToolCall>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct StubChatResponse {
+        text: String,
+        reasoning: String,
+        tool_calls: Vec<ToolCall>,
+    }
+
+    impl fmt::Display for StubChatResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.text)
+        }
+    }
+
+    impl ChatResponse for StubChatResponse {
+        fn text(&self) -> Option<String> {
+            Some(self.text.clone())
+        }
+
+        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+            if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(self.tool_calls.clone())
+            }
+        }
+
+        fn thinking(&self) -> Option<String> {
+            if self.reasoning.is_empty() {
+                None
+            } else {
+                Some(self.reasoning.clone())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for RecordingLlmProvider {
+        async fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            tools: Option<&[Tool]>,
+            json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            self.calls.lock().expect("lock calls").push(LlmInvocation {
+                messages_json: serde_json::to_string(messages).expect("serialize messages"),
+                tool_names: tools
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect(),
+                output_schema: json_schema,
+            });
+
+            if let Some(error) = &self.error {
+                return Err(LLMError::ProviderError(error.clone()));
+            }
+
+            Ok(Box::new(StubChatResponse {
+                text: self.text.clone(),
+                reasoning: self.reasoning.clone(),
+                tool_calls: self.tool_calls.clone(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for RecordingLlmProvider {
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<CompletionResponse, LLMError> {
+            Ok(CompletionResponse {
+                text: self.text.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingLlmProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ModelsProvider for RecordingLlmProvider {
+        async fn list_models(
+            &self,
+            _request: Option<&ModelListRequest>,
+        ) -> Result<Box<dyn ModelListResponse>, LLMError> {
+            Err(LLMError::ProviderError("not used in tests".to_string()))
+        }
+    }
+
+    impl LLMProvider for RecordingLlmProvider {}
+
+    #[derive(Debug)]
+    struct EchoTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl ToolRuntime for EchoTool {
+        async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
+            Ok(json!({ "echo": args }))
+        }
+    }
+
+    impl ToolT for EchoTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "echo tool"
+        }
+
+        fn args_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            })
+        }
+    }
+
+    fn component_host(
+        llm: Arc<dyn LLMProvider>,
+        tools: Vec<Arc<dyn ToolT>>,
+    ) -> (
+        ComponentHost,
+        broadcast::Receiver<odyssey_rs_protocol::EventMsg>,
+    ) {
+        let (sender, receiver) = broadcast::channel(8);
+        (
+            ComponentHost::new(
+                llm,
+                tools,
+                Uuid::from_u128(10),
+                Uuid::from_u128(11),
+                sender,
+                TurnContext::default(),
+            ),
+            receiver,
+        )
+    }
+
+    fn write_file(root: &Path, relative: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = root.join(relative);
+        std::fs::write(&path, contents).expect("write file");
+        path
+    }
+
+    #[test]
+    fn resolve_module_path_accepts_existing_files_and_rejects_missing_entrypoints() {
+        let temp = tempdir().expect("tempdir");
+        let module_path = write_file(temp.path(), "agent.wasm", b"\0asm");
+
+        assert_eq!(
+            resolve_module_path(temp.path(), "agent.wasm").expect("resolve existing"),
+            module_path
+        );
+
+        let error = resolve_module_path(temp.path(), "missing.wasm")
+            .expect_err("missing entrypoint must fail");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "executor error: wasm module entrypoint `missing.wasm` was not found under {}",
+                temp.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn execute_component_rejects_missing_files_and_non_component_bytes() {
+        let temp = tempdir().expect("tempdir");
+        let llm = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+
+        let (missing_host, _) = component_host(llm.clone(), Vec::new());
+        let missing_path = temp.path().join("missing.wasm");
+        let missing_error =
+            execute_component(&missing_path, missing_host, "{}", "agent", ABI_VERSION)
+                .expect_err("missing module should fail");
+        assert_eq!(
+            missing_error.to_string(),
+            format!(
+                "io error at {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )
+        );
+
+        let non_component_path =
+            write_file(temp.path(), "not-a-component.wasm", b"\0asm\x01\0\0\0");
+        let (non_component_host, _) = component_host(llm, Vec::new());
+        let non_component_error = execute_component(
+            &non_component_path,
+            non_component_host,
+            "{}",
+            "agent",
+            ABI_VERSION,
+        )
+        .expect_err("plain wasm module should fail");
+        assert_eq!(
+            non_component_error.to_string(),
+            format!(
+                "executor error: wasm agent entrypoint `{}` is not a component",
+                non_component_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn validate_descriptor_rejects_incompatible_components() {
+        let base = AgentDescriptor {
+            id: "demo".to_string(),
+            abi_version: ABI_VERSION.to_string(),
+            runner_class: RUNNER_CLASS.to_string(),
+        };
+
+        validate_descriptor("demo", ABI_VERSION, base.clone()).expect("matching descriptor");
+
+        let wrong_id = validate_descriptor(
+            "other",
+            ABI_VERSION,
+            AgentDescriptor {
+                id: "demo".to_string(),
+                ..base.clone()
+            },
+        )
+        .expect_err("id mismatch should fail");
+        assert_eq!(
+            wrong_id.to_string(),
+            "executor error: wasm component id `demo` does not match selected agent `other`"
+        );
+
+        let wrong_runner = validate_descriptor(
+            "demo",
+            ABI_VERSION,
+            AgentDescriptor {
+                runner_class: "native".to_string(),
+                ..base.clone()
+            },
+        )
+        .expect_err("runner mismatch should fail");
+        assert_eq!(
+            wrong_runner.to_string(),
+            "executor error: unsupported wasm runner class `native`"
+        );
+
+        let wrong_abi = validate_descriptor(
+            "demo",
+            "v4",
+            AgentDescriptor {
+                abi_version: ABI_VERSION.to_string(),
+                ..base.clone()
+            },
+        )
+        .expect_err("selected ABI mismatch should fail");
+        assert_eq!(
+            wrong_abi.to_string(),
+            format!(
+                "executor error: wasm component ABI `{ABI_VERSION}` does not match selected agent ABI `v4`"
+            )
+        );
+
+        let unsupported_abi = validate_descriptor(
+            "demo",
+            "v999",
+            AgentDescriptor {
+                abi_version: "v999".to_string(),
+                ..base
+            },
+        )
+        .expect_err("unsupported ABI should fail");
+        assert_eq!(
+            unsupported_abi.to_string(),
+            "executor error: unsupported wasm agent ABI `v999`; expected `v3`"
+        );
+    }
+
+    #[test]
+    fn from_component_descriptor_preserves_export_metadata() {
+        let descriptor = from_component_descriptor(super::odyssey_agent::AgentDescriptor {
+            id: "math".to_string(),
+            abi_version: ABI_VERSION.to_string(),
+            runner_class: RUNNER_CLASS.to_string(),
+        });
+
+        assert_eq!(
+            descriptor,
+            AgentDescriptor {
+                id: "math".to_string(),
+                abi_version: ABI_VERSION.to_string(),
+                runner_class: RUNNER_CLASS.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn render_output_handles_text_json_and_invalid_payloads() {
+        assert_eq!(render_output("\"hello\"".to_string()), "hello");
+        assert_eq!(
+            render_output("{\"status\":\"ok\"}".to_string()),
+            "{\n  \"status\": \"ok\"\n}"
+        );
+        assert_eq!(render_output("not-json".to_string()), "not-json");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_host_llm_chat_serializes_messages_tools_and_schema() {
+        use super::odyssey_host::Host as _;
+
+        let provider = RecordingLlmProvider {
+            text: "hello".to_string(),
+            reasoning: "think".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Read".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                },
+            }],
+            ..RecordingLlmProvider::default()
+        };
+        let provider = Arc::new(provider);
+        let (mut host, _) = component_host(provider.clone(), Vec::new());
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::Text,
+            content: "hello".to_string(),
+        }];
+        let tools = vec![HostToolDefinition {
+            name: "Read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }),
+        }];
+        let output_schema = StructuredOutputFormat {
+            name: "answer".to_string(),
+            description: Some("Structured answer".to_string()),
+            schema: Some(json!({
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                    "status": { "type": "string" }
+                }
+            })),
+            strict: Some(true),
+        };
+
+        let request = LlmChatRequest {
+            messages_json: json_to_string(&messages).expect("serialize messages"),
+            tools_json: Some(json_to_string(&tools).expect("serialize tools")),
+            output_schema_json: Some(json_to_string(&output_schema).expect("serialize schema")),
+        };
+
+        let raw_response = host
+            .llm_chat(json_to_string(&request).expect("serialize request"))
+            .expect("llm chat should succeed");
+        let response: LlmChatResponse = string_to_json(&raw_response).expect("decode response");
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.reasoning, "think");
+        assert_eq!(
+            response.tool_calls_json,
+            Some(
+                json_to_string(&vec![ToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "{\"path\":\"README.md\"}".to_string(),
+                    },
+                }])
+                .expect("serialize tool calls")
+            )
+        );
+
+        let calls = provider.calls.lock().expect("lock calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].messages_json,
+            json_to_string(&messages).expect("serialize expected messages")
+        );
+        assert_eq!(calls[0].tool_names, vec!["Read".to_string()]);
+        assert_eq!(calls[0].output_schema, Some(output_schema));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_host_llm_chat_rejects_invalid_payloads_and_provider_errors() {
+        use super::odyssey_host::Host as _;
+
+        let provider = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+        let (mut host, _) = component_host(provider, Vec::new());
+
+        let invalid_request = host
+            .llm_chat("{".to_string())
+            .expect_err("invalid request must fail");
+        assert!(
+            invalid_request.starts_with("invalid llm chat request:"),
+            "unexpected error: {invalid_request}"
+        );
+
+        let invalid_messages = host
+            .llm_chat(
+                json_to_string(&LlmChatRequest {
+                    messages_json: "{".to_string(),
+                    tools_json: None,
+                    output_schema_json: None,
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("invalid messages must fail");
+        assert!(
+            invalid_messages.starts_with("invalid llm chat messages:"),
+            "unexpected error: {invalid_messages}"
+        );
+
+        let invalid_tools = host
+            .llm_chat(
+                json_to_string(&LlmChatRequest {
+                    messages_json: "[]".to_string(),
+                    tools_json: Some("{".to_string()),
+                    output_schema_json: None,
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("invalid tool schema must fail");
+        assert!(
+            invalid_tools.starts_with("invalid llm tool schema payload:"),
+            "unexpected error: {invalid_tools}"
+        );
+
+        let invalid_schema = host
+            .llm_chat(
+                json_to_string(&LlmChatRequest {
+                    messages_json: "[]".to_string(),
+                    tools_json: None,
+                    output_schema_json: Some("{".to_string()),
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("invalid output schema must fail");
+        assert!(
+            invalid_schema.starts_with("invalid llm output schema payload:"),
+            "unexpected error: {invalid_schema}"
+        );
+
+        let failing_provider = Arc::new(RecordingLlmProvider {
+            error: Some("provider down".to_string()),
+            ..RecordingLlmProvider::default()
+        }) as Arc<dyn LLMProvider>;
+        let (mut host, _) = component_host(failing_provider, Vec::new());
+        let provider_error = host
+            .llm_chat(
+                json_to_string(&LlmChatRequest {
+                    messages_json: "[]".to_string(),
+                    tools_json: None,
+                    output_schema_json: None,
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("provider error must surface");
+        assert_eq!(provider_error, "Provider Error: provider down");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_host_tool_call_validates_requests_and_executes_tools() {
+        use super::odyssey_host::Host as _;
+
+        let llm = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+        let tools = vec![Arc::new(EchoTool { name: "Read" }) as Arc<dyn ToolT>];
+        let (mut host, _) = component_host(llm, tools);
+
+        let invalid_request = host
+            .tool_call("{".to_string())
+            .expect_err("invalid request must fail");
+        assert!(
+            invalid_request.starts_with("invalid tool request:"),
+            "unexpected error: {invalid_request}"
+        );
+
+        let invalid_args = host
+            .tool_call(
+                json_to_string(&HostToolCallRequest {
+                    tool: "Read".to_string(),
+                    arguments_json: "{".to_string(),
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("invalid args must fail");
+        assert!(
+            invalid_args.starts_with("invalid tool arguments:"),
+            "unexpected error: {invalid_args}"
+        );
+
+        let missing_tool = host
+            .tool_call(
+                json_to_string(&HostToolCallRequest {
+                    tool: "Write".to_string(),
+                    arguments_json: "{}".to_string(),
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("missing tool must fail");
+        assert_eq!(missing_tool, "tool `Write` is not available");
+
+        let raw_response = host
+            .tool_call(
+                json_to_string(&HostToolCallRequest {
+                    tool: "Read".to_string(),
+                    arguments_json: "{\"path\":\"README.md\"}".to_string(),
+                })
+                .expect("serialize request"),
+            )
+            .expect("tool call should succeed");
+        let response: HostToolCallResponse =
+            string_to_json(&raw_response).expect("decode tool response");
+        assert_eq!(
+            string_to_json::<Value>(&response.result_json).expect("decode result payload"),
+            json!({
+                "echo": {
+                    "path": "README.md"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn component_host_emit_event_rejects_invalid_json_and_forwards_payloads() {
+        use super::odyssey_host::Host as _;
+
+        let llm = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+        let (mut host, mut receiver) = component_host(llm, Vec::new());
+
+        let invalid = host
+            .emit_event("{".to_string())
+            .expect_err("invalid event must fail");
+        assert!(
+            invalid.starts_with("invalid autoagents event:"),
+            "unexpected error: {invalid}"
+        );
+
+        host.emit_event(
+            json_to_string(&AutoAgentsEvent::ToolCallRequested {
+                sub_id: Uuid::nil(),
+                actor_id: Uuid::nil(),
+                id: "call-1".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: "{\"path\":\"README.md\"}".to_string(),
+            })
+            .expect("serialize event"),
+        )
+        .expect("emit valid event");
+
+        let event = receiver.try_recv().expect("receive mapped event");
+        match event.payload {
+            EventPayload::ToolCallStarted {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "Read");
+                assert_eq!(arguments, json!({ "path": "README.md" }));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+}

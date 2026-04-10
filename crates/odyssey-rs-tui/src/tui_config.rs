@@ -7,7 +7,7 @@
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// TUI-specific user preferences that survive restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,27 +36,35 @@ impl TuiConfig {
             .map(|dirs| dirs.config_dir().join("tui.json"))
     }
 
+    fn load_from_path(path: &Path) -> Self {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
     /// Load the config from disk. Returns `Default` if the file does not exist
     /// or cannot be parsed.
     pub fn load() -> Self {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        serde_json::from_str(&raw).unwrap_or_default()
+        Self::load_from_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 
     /// Persist the config to disk. Creates parent directories as needed.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().ok_or_else(|| anyhow::anyhow!("cannot resolve config dir"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
-        Ok(())
+        self.save_to_path(&path)
     }
 }
 
@@ -65,6 +73,9 @@ impl TuiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn default_theme_is_odyssey() {
@@ -86,5 +97,31 @@ mod tests {
     fn missing_fields_use_defaults() {
         let parsed: TuiConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.theme, "odyssey");
+    }
+
+    #[test]
+    fn load_from_path_returns_defaults_for_missing_and_invalid_json() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("tui.json");
+
+        assert_eq!(TuiConfig::load_from_path(&path).theme, "odyssey");
+
+        fs::write(&path, "{invalid").expect("write invalid config");
+        assert_eq!(TuiConfig::load_from_path(&path).theme, "odyssey");
+    }
+
+    #[test]
+    fn save_to_path_creates_parent_directories_and_round_trips() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("nested").join("tui.json");
+        let config = TuiConfig {
+            theme: "dracula".to_string(),
+        };
+
+        config.save_to_path(&path).expect("save config");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        assert!(raw.contains("dracula"));
+        assert_eq!(TuiConfig::load_from_path(&path).theme, "dracula");
     }
 }

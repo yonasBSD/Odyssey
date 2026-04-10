@@ -431,6 +431,7 @@ fn resolve_model_spec(
 
 #[cfg(test)]
 mod tests {
+    use autoagents_llm::chat::ChatRole;
     use chrono::Utc;
     use odyssey_rs_manifest::{
         BundleExecutor, BundleManifest, BundleMemory, BundleSandbox, BundleSignatures, BundleTool,
@@ -449,9 +450,9 @@ mod tests {
     use crate::resolver::bundle::ResolvedBundle;
     use crate::runtime::executor::{
         build_turn_context, collect_turn_chat_history, effective_sandbox_mode,
-        resolve_execution_work_dir, resolve_model_spec,
+        resolve_execution_work_dir, resolve_model_spec, session_history,
     };
-    use crate::session::SessionRecord;
+    use crate::session::{SessionRecord, TurnChatMessageRecord, TurnRecord};
 
     fn manifest(mode: SandboxMode) -> BundleManifest {
         BundleManifest {
@@ -708,5 +709,80 @@ mod tests {
             error.to_string(),
             "executor error: working directory is not visible inside sandbox: /workspace/project"
         );
+    }
+
+    #[test]
+    fn resolve_execution_work_dir_defaults_and_relative_paths_are_supported() {
+        let default_work_dir = PathBuf::from("/sandbox/app");
+
+        assert_eq!(
+            resolve_execution_work_dir(&default_work_dir, &[], None).expect("default cwd"),
+            default_work_dir
+        );
+        assert_eq!(
+            resolve_execution_work_dir(
+                &default_work_dir,
+                &[],
+                Some(&TurnContextOverride {
+                    cwd: Some("   ".to_string()),
+                    ..TurnContextOverride::default()
+                }),
+            )
+            .expect("blank cwd"),
+            PathBuf::from("/sandbox/app")
+        );
+        assert_eq!(
+            resolve_execution_work_dir(
+                &default_work_dir,
+                &[],
+                Some(&TurnContextOverride {
+                    cwd: Some("src/bin".to_string()),
+                    ..TurnContextOverride::default()
+                }),
+            )
+            .expect("relative cwd"),
+            PathBuf::from("/sandbox/app/src/bin")
+        );
+        assert_eq!(
+            resolve_execution_work_dir(
+                &default_work_dir,
+                &[],
+                Some(&TurnContextOverride {
+                    cwd: Some("/sandbox/app/logs".to_string()),
+                    ..TurnContextOverride::default()
+                }),
+            )
+            .expect("visible absolute cwd"),
+            PathBuf::from("/sandbox/app/logs")
+        );
+    }
+
+    #[test]
+    fn session_history_ignores_empty_turns_and_preserves_chat_messages() {
+        let turns = vec![
+            TurnRecord {
+                turn_id: Uuid::new_v4(),
+                prompt: "plain prompt".to_string(),
+                response: "plain response".to_string(),
+                chat_history: Vec::new(),
+                created_at: Utc::now(),
+            },
+            TurnRecord::from_history(
+                Uuid::new_v4(),
+                &Task::new("ignored"),
+                "ignored",
+                vec![
+                    TurnChatMessageRecord::from_text(ChatRole::User, "hello"),
+                    TurnChatMessageRecord::from_text(ChatRole::Assistant, "world"),
+                ],
+                Utc::now(),
+            ),
+        ];
+
+        let history = session_history(&turns);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[1].content, "world");
     }
 }

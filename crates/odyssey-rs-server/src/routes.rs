@@ -376,6 +376,22 @@ spec:
         .expect("json response")
     }
 
+    async fn text_response(
+        app: axum::Router,
+        request: Request<Body>,
+        expected_status: StatusCode,
+    ) -> String {
+        let response = app.oneshot(request).await.expect("router response");
+        assert_eq!(response.status(), expected_status);
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("utf8 body")
+    }
+
     #[tokio::test]
     async fn bundle_and_session_routes_round_trip() {
         let temp = tempdir().expect("tempdir");
@@ -633,5 +649,139 @@ spec:
 
         assert_eq!(bundles, serde_json::json!([]));
         assert_eq!(sessions, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn bundle_build_route_rejects_malformed_json() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let app = router(AppState {
+            runtime: runtime.clone(),
+            bundles: runtime.bundle_store(),
+            hub_url: runtime.config().hub_url.clone(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/bundles/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{invalid-json"))
+                    .expect("build request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn session_routes_reject_invalid_uuid_path_parameters() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let app = router(AppState {
+            runtime: runtime.clone(),
+            bundles: runtime.bundle_store(),
+            hub_url: runtime.config().hub_url.clone(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/sessions/not-a-uuid")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_session_routes_surface_internal_errors() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let app = router(AppState {
+            runtime: runtime.clone(),
+            bundles: runtime.bundle_store(),
+            hub_url: runtime.config().hub_url.clone(),
+        });
+        let missing_session = Uuid::new_v4();
+
+        let fetched = text_response(
+            app.clone(),
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/sessions/{missing_session}"))
+                .body(Body::empty())
+                .expect("get request"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let deleted = text_response(
+            app.clone(),
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/sessions/{missing_session}"))
+                .body(Body::empty())
+                .expect("delete request"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let ran = text_response(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/sessions/{missing_session}/run-sync"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "input": serde_json::to_value(
+                            odyssey_rs_protocol::Task::new("hello")
+                        ).expect("serialize task")
+                    }))
+                    .expect("serialize run request"),
+                ))
+                .expect("run request"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+
+        assert!(fetched.contains("session not found"));
+        assert!(deleted.contains("session not found"));
+        assert!(ran.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn approval_route_rejects_unknown_decisions() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        let app = router(AppState {
+            runtime: runtime.clone(),
+            bundles: runtime.bundle_store(),
+            hub_url: runtime.config().hub_url.clone(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/approvals/{}", Uuid::new_v4()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "decision": "maybe"
+                        }))
+                        .expect("serialize approval request"),
+                    ))
+                    .expect("approval request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

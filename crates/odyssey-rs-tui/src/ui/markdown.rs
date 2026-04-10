@@ -277,3 +277,198 @@ impl<'t> MdRenderer<'t> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown;
+    use crate::ui::theme::ODYSSEY;
+    use pretty_assertions::assert_eq;
+    use ratatui::style::{Modifier, Style};
+
+    fn line_texts(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_markdown_formats_headings_paragraphs_and_rules() {
+        let lines = render_markdown("# Title\n\nParagraph\n\n---", &ODYSSEY, Style::default());
+        let texts = line_texts(&lines);
+
+        assert_eq!(
+            texts,
+            vec![
+                "# Title".to_string(),
+                "".to_string(),
+                "Paragraph".to_string(),
+                "".to_string(),
+                "─".repeat(40),
+                "".to_string(),
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(ODYSSEY.primary));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn render_markdown_formats_lists_and_block_quotes() {
+        let lines = render_markdown(
+            "- first\n- second\n\n1. one\n2. two\n\n> quoted",
+            &ODYSSEY,
+            Style::default(),
+        );
+        let texts = line_texts(&lines);
+
+        assert_eq!(
+            texts,
+            vec![
+                "• first".to_string(),
+                "• second".to_string(),
+                "".to_string(),
+                "1. one".to_string(),
+                "2. two".to_string(),
+                "".to_string(),
+                "│ quoted".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ]
+        );
+        assert_eq!(lines[6].spans[0].style.fg, Some(ODYSSEY.text_muted));
+        assert!(
+            lines[6].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn render_markdown_formats_inline_and_fenced_code() {
+        let lines = render_markdown(
+            "`inline`\n\n```rust\nlet x = 1;\n```\n",
+            &ODYSSEY,
+            Style::default(),
+        );
+        let texts = line_texts(&lines);
+
+        assert_eq!(texts[0], "inline");
+        assert_eq!(lines[0].spans[0].style.fg, Some(ODYSSEY.accent));
+        assert_eq!(lines[0].spans[0].style.bg, Some(ODYSSEY.bg_popup));
+        assert_eq!(texts[2], " rust");
+        assert_eq!(lines[2].spans[0].style.fg, Some(ODYSSEY.text_muted));
+        assert!(
+            lines[2].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert_eq!(texts[3], "let x = 1;");
+        assert_eq!(lines[3].spans[0].style.fg, Some(ODYSSEY.accent));
+    }
+
+    #[test]
+    fn render_markdown_applies_inline_styles_and_soft_breaks() {
+        let lines = render_markdown(
+            "**bold** *italic* ~~old~~ [link](https://example.com)\nnext line",
+            &ODYSSEY,
+            Style::default(),
+        );
+        let texts = line_texts(&lines);
+
+        assert_eq!(
+            texts,
+            vec!["bold italic old link next line".to_string(), "".to_string()]
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            lines[0].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            lines[0].spans[4]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert_eq!(lines[0].spans[6].style.fg, Some(ODYSSEY.primary));
+        assert!(
+            lines[0].spans[6]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn render_markdown_formats_nested_lists_with_indentation() {
+        let lines = render_markdown(
+            "1. parent\n   - child\n2. sibling",
+            &ODYSSEY,
+            Style::default(),
+        );
+        let texts = line_texts(&lines);
+
+        assert_eq!(
+            texts,
+            vec![
+                "1. parent".to_string(),
+                "  • child".to_string(),
+                "2. sibling".to_string(),
+                "".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_markdown_formats_lower_heading_levels_and_hard_breaks() {
+        let lines = render_markdown(
+            "## Section\n### Detail\n#### Note\n\nline one  \nline two",
+            &ODYSSEY,
+            Style::default(),
+        );
+        let texts = line_texts(&lines);
+
+        assert_eq!(
+            texts,
+            vec![
+                "## Section".to_string(),
+                "".to_string(),
+                "### Detail".to_string(),
+                "".to_string(),
+                "#### Note".to_string(),
+                "".to_string(),
+                "line one".to_string(),
+                "line two".to_string(),
+                "".to_string(),
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(ODYSSEY.secondary));
+        assert_eq!(lines[2].spans[0].style.fg, Some(ODYSSEY.accent));
+        assert_eq!(lines[4].spans[0].style.fg, Some(ODYSSEY.text));
+        assert!(
+            lines[4].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+}

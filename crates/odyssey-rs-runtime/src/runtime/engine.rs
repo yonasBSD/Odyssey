@@ -705,8 +705,9 @@ mod tests {
     use autoagents_llm::{FunctionCall, ToolCall};
     use chrono::Utc;
     use odyssey_rs_protocol::{
-        DEFAULT_HUB_URL, EventPayload, Role, SandboxMode, SessionSandboxFilesystem,
-        SessionSandboxMounts, SessionSandboxOverlay, SessionSandboxPermissions, SessionSpec,
+        ApprovalDecision, DEFAULT_HUB_URL, EventPayload, ExecutionRequest, Role, SandboxMode,
+        SessionSandboxFilesystem, SessionSandboxMounts, SessionSandboxOverlay,
+        SessionSandboxPermissions, SessionSpec,
     };
     use odyssey_rs_protocol::{ModelSpec, Task};
     use odyssey_rs_sandbox::{HostExecProvider, SandboxHandle};
@@ -1473,5 +1474,118 @@ spec:
             .expect("list");
         assert_eq!(list.status_code, Some(0));
         assert!(list.stdout.contains("hellp.py"));
+    }
+
+    #[test]
+    fn bundle_management_helpers_list_metadata_models_and_skills() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+
+        let artifact_root = temp.path().join("artifacts");
+        fs::create_dir_all(&artifact_root).expect("create artifact dir");
+        let artifact = runtime
+            .build_to(&project, &artifact_root)
+            .expect("build artifact");
+        assert_eq!(artifact.metadata.id, "alpha");
+
+        let install = runtime.build_and_install(&project).expect("install bundle");
+        assert_eq!(install.metadata.id, "alpha");
+        assert_eq!(
+            runtime
+                .inspect_bundle("local/alpha@0.1.0")
+                .expect("inspect bundle")
+                .id,
+            "alpha"
+        );
+        assert_eq!(
+            runtime
+                .list_agents("local/alpha@0.1.0")
+                .expect("list agents"),
+            vec!["alpha-agent".to_string()]
+        );
+        assert_eq!(
+            runtime
+                .list_models("local/alpha@0.1.0")
+                .expect("list models"),
+            vec!["gpt-4.1-mini".to_string()]
+        );
+        let skills = runtime
+            .list_skills("local/alpha@0.1.0")
+            .expect("list skills");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "repo-hygiene");
+
+        let export_root = temp.path().join("exports");
+        fs::create_dir_all(&export_root).expect("create export dir");
+        let archive = runtime
+            .export_bundle("local/alpha@0.1.0", &export_root)
+            .expect("export bundle");
+        assert!(archive.exists());
+
+        let imported_root = temp.path().join("imported-runtime");
+        fs::create_dir_all(&imported_root).expect("create imported root");
+        let imported_runtime =
+            OdysseyRuntime::new(runtime_config(&imported_root)).expect("imported runtime");
+        let imported = imported_runtime
+            .import_bundle(&archive)
+            .expect("import bundle");
+        assert_eq!(imported.metadata.id, "alpha");
+    }
+
+    #[test]
+    fn approval_and_subscription_helpers_handle_unknown_requests() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let session = runtime
+            .create_session("local/alpha@0.1.0")
+            .expect("create session");
+        let _receiver = runtime
+            .subscribe_session(session.id)
+            .expect("subscribe to session");
+
+        assert_eq!(
+            runtime
+                .resolve_approval(Uuid::new_v4(), ApprovalDecision::AllowOnce)
+                .expect("unknown approval"),
+            false
+        );
+        assert_eq!(runtime.execution_status(Uuid::new_v4()), None);
+        assert_eq!(
+            runtime.get_session(session.id).expect("get session").id,
+            session.id
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_returns_handle_for_existing_session() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+        runtime.build_and_install(&project).expect("install bundle");
+
+        let session = runtime
+            .create_session("local/alpha@0.1.0")
+            .expect("create session");
+        let handle = runtime
+            .submit(ExecutionRequest {
+                request_id: Uuid::new_v4(),
+                session_id: session.id,
+                input: Task::new("hello"),
+                turn_context: None,
+            })
+            .await
+            .expect("submit request");
+
+        assert_eq!(handle.session_id, session.id);
     }
 }

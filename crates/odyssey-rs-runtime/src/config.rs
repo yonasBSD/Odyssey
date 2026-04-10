@@ -392,6 +392,57 @@ model_config:
     }
 
     #[test]
+    fn load_from_file_returns_defaults_when_config_is_missing() {
+        let temp = tempdir().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILE_NAME);
+
+        let config = RuntimeConfig::load_from_file(&config_path).expect("missing config");
+
+        assert_eq!(config.bind_addr, DEFAULT_RUNTIME_BIND_ADDR);
+        assert_eq!(config.hub_url, DEFAULT_HUB_URL);
+        assert!(config.bundle_overrides.is_empty());
+    }
+
+    #[test]
+    fn load_from_file_prefers_default_model_over_legacy_model_fields() {
+        let temp = tempdir().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILE_NAME);
+        fs::write(
+            &config_path,
+            r#"
+model: gpt-5.4
+model_provider: openai
+default_model:
+  provider: anthropic
+  name: claude-sonnet-4-5
+  config:
+    max_tokens: 2048
+"#,
+        )
+        .expect("write config");
+
+        let config = RuntimeConfig::load_from_file(&config_path).expect("load config");
+
+        assert_eq!(config.default_model.provider, "anthropic");
+        assert_eq!(config.default_model.name, "claude-sonnet-4-5");
+        assert_eq!(
+            config.default_model.config,
+            Some(serde_json::json!({ "max_tokens": 2048 }))
+        );
+    }
+
+    #[test]
+    fn load_from_file_rejects_invalid_yaml() {
+        let temp = tempdir().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILE_NAME);
+        fs::write(&config_path, "default_model: [").expect("write invalid config");
+
+        let error = RuntimeConfig::load_from_file(&config_path).expect_err("invalid yaml");
+
+        assert!(error.to_string().contains("invalid runtime config"));
+    }
+
+    #[test]
     fn session_sandbox_for_agent_merges_configured_and_explicit_overrides() {
         let mut config = RuntimeConfig::default();
         config.bundle_overrides.insert(
@@ -456,6 +507,37 @@ model_config:
             vec![TEST_SANDBOX_WRITE_PATH.to_string()]
         );
         assert_eq!(merged.env.get("TOKEN"), Some(&"EXPLICIT_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn session_sandbox_for_agent_uses_explicit_overlay_without_bundle_override() {
+        let config = RuntimeConfig::default();
+        let explicit = SessionSandboxOverlay {
+            mode: Some(SandboxMode::WorkspaceWrite),
+            permissions: SessionSandboxPermissions {
+                filesystem: SessionSandboxFilesystem {
+                    exec: vec!["/usr/local/bin".to_string()],
+                    mounts: SessionSandboxMounts {
+                        read: vec!["/workspace".to_string()],
+                        write: vec![TEST_SANDBOX_WRITE_PATH.to_string()],
+                    },
+                },
+            },
+            env: BTreeMap::from([("TOKEN".to_string(), "EXPLICIT_TOKEN".to_string())]),
+            system_tools: vec!["git".to_string()],
+        };
+
+        let sandbox = config
+            .session_sandbox_for_agent(
+                "local",
+                "hello-world",
+                "0.1.0",
+                "hello-world",
+                Some(&explicit),
+            )
+            .expect("explicit sandbox");
+
+        assert_eq!(sandbox, explicit);
     }
 
     #[test]
@@ -524,6 +606,27 @@ model_config:
             Some(&explicit),
         );
         assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn session_model_for_agent_falls_back_to_bundle_model_without_override() {
+        let config = RuntimeConfig::default();
+        let bundle_model = ModelSpec {
+            provider: "openai".to_string(),
+            name: "gpt-4.1-mini".to_string(),
+            config: Some(serde_json::json!({ "reasoning_effort": "low" })),
+        };
+
+        let selected = config.session_model_for_agent(
+            "local",
+            "hello-world",
+            "0.2.0",
+            "hello-world",
+            &bundle_model,
+            None,
+        );
+
+        assert_eq!(selected, bundle_model);
     }
 
     #[test]

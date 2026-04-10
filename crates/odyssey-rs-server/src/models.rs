@@ -69,7 +69,7 @@ mod tests {
         ApprovalResolution, BuildRequest, CreateSessionRequest, ExportRequest, ImportRequest,
         PlaceholderRequest, PublishRequest, ResolveApprovalRequest, RunRequest, TurnAccepted,
     };
-    use odyssey_rs_protocol::{ApprovalDecision, Task};
+    use odyssey_rs_protocol::{ApprovalDecision, SandboxMode, Task};
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use uuid::Uuid;
@@ -127,6 +127,75 @@ mod tests {
         assert_eq!(export.output_path, "/workspace/out");
         assert_eq!(import.archive_path, "/workspace/demo.odyssey");
         assert_eq!(approval.decision, ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn request_models_deserialize_optional_overrides() {
+        let task = Task::new("hello");
+        let create: CreateSessionRequest = serde_json::from_value(json!({
+            "bundle_ref": "demo@0.1.0",
+            "agent_id": "planner",
+            "model": {
+                "provider": "openai",
+                "name": "gpt-5.4",
+                "config": {
+                    "reasoning_effort": "high"
+                }
+            },
+            "sandbox": {
+                "mode": "workspace_write",
+                "permissions": {
+                    "filesystem": {
+                        "exec": ["/usr/bin"],
+                        "mounts": {
+                            "read": ["/workspace"],
+                            "write": ["/workspace/out"]
+                        }
+                    }
+                },
+                "env": {
+                    "TOKEN": "VALUE"
+                },
+                "system_tools": ["git"]
+            }
+        }))
+        .expect("create session request");
+        let run: RunRequest = serde_json::from_value(json!({
+            "input": serde_json::to_value(&task).expect("serialize task"),
+            "turn_context": {
+                "cwd": "/workspace/demo",
+                "model": {
+                    "provider": "openai",
+                    "name": "gpt-5.4",
+                    "config": null
+                }
+            }
+        }))
+        .expect("run request");
+
+        assert_eq!(create.agent_id.as_deref(), Some("planner"));
+        assert_eq!(
+            create
+                .model
+                .as_ref()
+                .expect("model override")
+                .config
+                .as_ref(),
+            Some(&json!({ "reasoning_effort": "high" }))
+        );
+        let sandbox = create.sandbox.expect("sandbox override");
+        assert_eq!(sandbox.mode, Some(SandboxMode::WorkspaceWrite));
+        assert_eq!(
+            sandbox.permissions.filesystem.mounts.write,
+            vec!["/workspace/out".to_string()]
+        );
+        assert_eq!(sandbox.env.get("TOKEN"), Some(&"VALUE".to_string()));
+        let turn_context = run.turn_context.expect("turn context");
+        assert_eq!(turn_context.cwd.as_deref(), Some("/workspace/demo"));
+        assert_eq!(
+            turn_context.model.expect("turn model").name,
+            "gpt-5.4".to_string()
+        );
     }
 
     #[test]

@@ -433,14 +433,30 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
+    use autoagents_core::agent::Context;
+    use autoagents_core::agent::memory::{MemoryProvider, MemoryType};
+    use autoagents_core::agent::{AgentDeriveT, AgentHooks, HookOutcome};
+    use autoagents_core::tool::{ToolCallError, ToolCallResult, ToolRuntime, ToolT};
+    use autoagents_llm::LLMProvider;
+    use autoagents_llm::ToolCall;
+    use autoagents_llm::chat::{ChatMessage, ChatProvider, ChatResponse, StructuredOutputFormat};
+    use autoagents_llm::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use autoagents_llm::embedding::EmbeddingProvider;
+    use autoagents_llm::error::LLMError;
+    use autoagents_llm::models::{ModelListRequest, ModelListResponse, ModelsProvider};
+    use futures::FutureExt;
+    use odyssey_rs_agent_abi::{HostToolSpec, RunRequest, RunResponse};
     use pretty_assertions::assert_eq;
     use serde_json::{Value, json};
 
-    use super::{AgentSdkError, validate_unique_tool_names};
+    use super::{
+        AgentSdkError, AugmentedAgent, DEFAULT_MAX_TURNS, DEFAULT_MEMORY_WINDOW, MemoryConfig,
+        OdysseyAgentApp, RunnableApp, build_memory, run_app, validate_unique_tool_names,
+    };
 
     #[derive(Debug)]
     struct DummyTool(&'static str);
@@ -451,6 +467,72 @@ mod tests {
             Ok(Value::Null)
         }
     }
+
+    #[derive(Clone, Debug, Default)]
+    struct NoopLlm;
+
+    #[derive(Debug)]
+    struct EmptyChatResponse;
+
+    impl fmt::Display for EmptyChatResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("")
+        }
+    }
+
+    impl ChatResponse for EmptyChatResponse {
+        fn text(&self) -> Option<String> {
+            Some(String::default())
+        }
+
+        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for NoopLlm {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            Ok(Box::new(EmptyChatResponse))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for NoopLlm {
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<CompletionResponse, LLMError> {
+            Ok(CompletionResponse {
+                text: String::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for NoopLlm {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ModelsProvider for NoopLlm {
+        async fn list_models(
+            &self,
+            _request: Option<&ModelListRequest>,
+        ) -> Result<Box<dyn ModelListResponse>, LLMError> {
+            Err(LLMError::ProviderError("unused in tests".to_string()))
+        }
+    }
+
+    impl LLMProvider for NoopLlm {}
 
     impl ToolT for DummyTool {
         fn name(&self) -> &str {
@@ -466,6 +548,203 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct DummyMemory;
+
+    #[async_trait]
+    impl MemoryProvider for DummyMemory {
+        async fn remember(&mut self, _message: &ChatMessage) -> Result<(), LLMError> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: Option<usize>,
+        ) -> Result<Vec<ChatMessage>, LLMError> {
+            Ok(Vec::new())
+        }
+
+        async fn clear(&mut self) -> Result<(), LLMError> {
+            Ok(())
+        }
+
+        fn memory_type(&self) -> MemoryType {
+            MemoryType::Custom
+        }
+
+        fn size(&self) -> usize {
+            0
+        }
+
+        fn clone_box(&self) -> Box<dyn MemoryProvider> {
+            Box::new(Self)
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct DummyAgent;
+
+    impl AgentDeriveT for DummyAgent {
+        type Output = String;
+
+        fn description(&self) -> &str {
+            "dummy agent"
+        }
+
+        fn output_schema(&self) -> Option<Value> {
+            None
+        }
+
+        fn name(&self) -> &str {
+            "dummy"
+        }
+
+        fn tools(&self) -> Vec<Box<dyn ToolT>> {
+            vec![Box::new(DummyTool("AgentTool"))]
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for DummyAgent {}
+
+    #[derive(Debug, Clone)]
+    struct RecordingAgent {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentDeriveT for RecordingAgent {
+        type Output = String;
+
+        fn description(&self) -> &str {
+            "recording agent"
+        }
+
+        fn output_schema(&self) -> Option<Value> {
+            Some(json!({ "type": "string" }))
+        }
+
+        fn name(&self) -> &str {
+            "recorder"
+        }
+
+        fn tools(&self) -> Vec<Box<dyn ToolT>> {
+            vec![Box::new(DummyTool("RecorderTool"))]
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for RecordingAgent {
+        async fn on_agent_create(&self) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push("create".to_string());
+        }
+
+        async fn on_run_start(
+            &self,
+            task: &autoagents_core::agent::task::Task,
+            _ctx: &Context,
+        ) -> HookOutcome {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("run_start:{}", task.prompt));
+            HookOutcome::Continue
+        }
+
+        async fn on_run_complete(
+            &self,
+            _task: &autoagents_core::agent::task::Task,
+            result: &Self::Output,
+            _ctx: &Context,
+        ) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("run_complete:{result}"));
+        }
+
+        async fn on_turn_start(&self, turn_index: usize, _ctx: &Context) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("turn_start:{turn_index}"));
+        }
+
+        async fn on_turn_complete(&self, turn_index: usize, _ctx: &Context) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("turn_complete:{turn_index}"));
+        }
+
+        async fn on_tool_call(&self, tool_call: &ToolCall, _ctx: &Context) -> HookOutcome {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("tool_call:{}", tool_call.function.name));
+            HookOutcome::Continue
+        }
+
+        async fn on_tool_start(&self, tool_call: &ToolCall, _ctx: &Context) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push(format!("tool_start:{}", tool_call.function.name));
+        }
+
+        async fn on_tool_result(
+            &self,
+            tool_call: &ToolCall,
+            result: &ToolCallResult,
+            _ctx: &Context,
+        ) {
+            self.log.lock().expect("lock log").push(format!(
+                "tool_result:{}:{}",
+                tool_call.function.name, result.success
+            ));
+        }
+
+        async fn on_tool_error(&self, tool_call: &ToolCall, err: Value, _ctx: &Context) {
+            self.log.lock().expect("lock log").push(format!(
+                "tool_error:{}:{}",
+                tool_call.function.name,
+                err["message"].as_str().unwrap_or_default()
+            ));
+        }
+
+        async fn on_agent_shutdown(&self) {
+            self.log
+                .lock()
+                .expect("lock log")
+                .push("shutdown".to_string());
+        }
+    }
+
+    fn request() -> RunRequest {
+        RunRequest {
+            session_id: "session".to_string(),
+            turn_id: "turn".to_string(),
+            prompt: "hello".to_string(),
+            system_prompt: Some("stay concise".to_string()),
+            history_json: None,
+            metadata_json: None,
+            host_tools: vec![HostToolSpec {
+                name: "Read".to_string(),
+                description: "Read file".to_string(),
+                args_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }),
+                output_schema: None,
+            }],
+        }
+    }
+
     #[test]
     fn duplicate_tool_names_are_rejected() {
         let agent_tools = vec![Box::new(DummyTool("Read")) as Box<dyn ToolT>];
@@ -478,5 +757,246 @@ mod tests {
             error.to_string(),
             AgentSdkError::DuplicateTool("Read".to_string()).to_string()
         );
+    }
+
+    #[test]
+    fn unique_tool_sets_are_accepted() {
+        let agent_tools = vec![Box::new(DummyTool("AgentTool")) as Box<dyn ToolT>];
+        let custom_tools = vec![Arc::new(DummyTool("CustomTool")) as Arc<dyn ToolT>];
+        let host_tools = vec![Arc::new(DummyTool("Read")) as Arc<dyn ToolT>];
+
+        validate_unique_tool_names(&agent_tools, &custom_tools, &host_tools)
+            .expect("unique tools should pass");
+    }
+
+    #[test]
+    fn host_tool_duplicates_are_rejected_after_custom_tool_validation() {
+        let custom_tools = vec![Arc::new(DummyTool("SharedTool")) as Arc<dyn ToolT>];
+        let host_tools = vec![Arc::new(DummyTool("SharedTool")) as Arc<dyn ToolT>];
+
+        let error = match validate_unique_tool_names(&[], &custom_tools, &host_tools) {
+            Ok(()) => panic!("host tool duplicates must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            AgentSdkError::DuplicateTool("SharedTool".to_string()).to_string()
+        );
+    }
+
+    #[test]
+    fn builders_initialize_defaults_and_clamp_turn_counts() {
+        let basic = OdysseyAgentApp::basic(DummyAgent);
+        assert_eq!(basic.custom_tools.len(), 0);
+        assert!(matches!(
+            basic.memory,
+            MemoryConfig::SlidingWindow(DEFAULT_MEMORY_WINDOW)
+        ));
+
+        let react = OdysseyAgentApp::react(DummyAgent).max_turns(0);
+        assert_eq!(react.executor.max_turns, 1);
+        assert_ne!(DEFAULT_MAX_TURNS, 0);
+    }
+
+    #[test]
+    fn builder_methods_accumulate_tools_and_replace_memory_configuration() {
+        let app = OdysseyAgentApp::basic(DummyAgent)
+            .tool(Arc::new(DummyTool("CustomOne")))
+            .tools(vec![Arc::new(DummyTool("CustomTwo")) as Arc<dyn ToolT>])
+            .memory_window(0);
+        let names = app
+            .custom_tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["CustomOne".to_string(), "CustomTwo".to_string()]
+        );
+        assert!(matches!(app.memory, MemoryConfig::SlidingWindow(1)));
+
+        let no_memory = OdysseyAgentApp::basic(DummyAgent).without_memory();
+        assert!(matches!(no_memory.memory, MemoryConfig::Disabled));
+
+        let custom_memory = OdysseyAgentApp::basic(DummyAgent).memory(Box::new(DummyMemory));
+        assert!(matches!(custom_memory.memory, MemoryConfig::Custom(_)));
+    }
+
+    #[test]
+    fn host_tools_mirror_runtime_request_catalog() {
+        let app = OdysseyAgentApp::basic(DummyAgent);
+        let catalog = app.host_tools(&request());
+        assert_eq!(catalog.specs().len(), 1);
+        assert!(catalog.contains("Read"));
+        assert!(!catalog.contains("Write"));
+    }
+
+    #[test]
+    fn build_memory_returns_none_when_disabled() {
+        let memory = build_memory(MemoryConfig::Disabled, &request()).expect("disabled memory");
+        assert!(memory.is_none());
+    }
+
+    #[test]
+    fn build_memory_surfaces_host_limitations_for_non_disabled_modes() {
+        let sliding = match build_memory(MemoryConfig::SlidingWindow(2), &request()) {
+            Ok(_) => panic!("sliding window memory should fail outside wasm"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            sliding.to_string(),
+            AgentSdkError::UnsupportedHostBuild.to_string()
+        );
+
+        let custom = match build_memory(MemoryConfig::Custom(Box::new(DummyMemory)), &request()) {
+            Ok(_) => panic!("custom memory should fail outside wasm"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            custom.to_string(),
+            AgentSdkError::UnsupportedHostBuild.to_string()
+        );
+    }
+
+    #[test]
+    fn augmented_agent_exposes_inner_custom_and_host_tools() {
+        let augmented = AugmentedAgent::new(
+            DummyAgent,
+            vec![Arc::new(DummyTool("CustomTool")) as Arc<dyn ToolT>],
+            OdysseyAgentApp::basic(DummyAgent)
+                .host_tools(&request())
+                .tools(),
+        );
+
+        let names = augmented
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "AgentTool".to_string(),
+                "CustomTool".to_string(),
+                "Read".to_string()
+            ]
+        );
+    }
+
+    struct StubRunnable;
+
+    #[async_trait]
+    impl RunnableApp for StubRunnable {
+        async fn run(self, request: &RunRequest) -> super::AgentResult<RunResponse> {
+            Ok(RunResponse::text(format!("echo: {}", request.prompt)))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_app_delegates_to_runnable_implementations() {
+        let response = run_app(StubRunnable, &request()).await.expect("run app");
+        assert_eq!(response, RunResponse::text("echo: hello"));
+    }
+
+    #[tokio::test]
+    async fn augmented_agent_forwards_identity_and_hook_callbacks() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let augmented = AugmentedAgent::new(
+            RecordingAgent { log: log.clone() },
+            vec![Arc::new(DummyTool("CustomTool")) as Arc<dyn ToolT>],
+            vec![Arc::new(DummyTool("HostTool")) as Arc<dyn ToolT>],
+        );
+        let context = Context::new(Arc::new(NoopLlm), None);
+        let task = autoagents_core::agent::task::Task::new("investigate");
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: autoagents_llm::FunctionCall {
+                name: "Read".to_string(),
+                arguments: "{\"path\":\"README.md\"}".to_string(),
+            },
+        };
+        let tool_result = ToolCallResult {
+            tool_name: "Read".to_string(),
+            success: true,
+            arguments: json!({ "path": "README.md" }),
+            result: json!({ "content": "hello" }),
+        };
+
+        assert_eq!(augmented.description(), "recording agent");
+        assert_eq!(augmented.output_schema(), Some(json!({ "type": "string" })));
+        assert_eq!(augmented.name(), "recorder");
+        assert_eq!(
+            augmented
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "RecorderTool".to_string(),
+                "CustomTool".to_string(),
+                "HostTool".to_string()
+            ]
+        );
+
+        assert!(matches!(
+            augmented.on_run_start(&task, &context).await,
+            HookOutcome::Continue
+        ));
+        assert!(matches!(
+            augmented.on_tool_call(&tool_call, &context).await,
+            HookOutcome::Continue
+        ));
+        augmented.on_agent_create().await;
+        augmented
+            .on_run_complete(&task, &"done".to_string(), &context)
+            .await;
+        augmented.on_turn_start(1, &context).await;
+        augmented.on_turn_complete(1, &context).await;
+        augmented.on_tool_start(&tool_call, &context).await;
+        augmented
+            .on_tool_result(&tool_call, &tool_result, &context)
+            .await;
+        augmented
+            .on_tool_error(&tool_call, json!({ "message": "boom" }), &context)
+            .await;
+        augmented.on_agent_shutdown().await;
+
+        assert_eq!(
+            log.lock().expect("lock log").clone(),
+            vec![
+                "run_start:investigate".to_string(),
+                "tool_call:Read".to_string(),
+                "create".to_string(),
+                "run_complete:done".to_string(),
+                "turn_start:1".to_string(),
+                "turn_complete:1".to_string(),
+                "tool_start:Read".to_string(),
+                "tool_result:Read:true".to_string(),
+                "tool_error:Read:boom".to_string(),
+                "shutdown".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn basic_and_react_apps_panic_outside_wasm_host_builds() {
+        let basic = std::panic::AssertUnwindSafe(run_app(
+            OdysseyAgentApp::basic(DummyAgent).without_memory(),
+            &request(),
+        ))
+        .catch_unwind()
+        .await;
+        assert!(basic.is_err());
+
+        let react = std::panic::AssertUnwindSafe(run_app(
+            OdysseyAgentApp::react(DummyAgent).without_memory(),
+            &request(),
+        ))
+        .catch_unwind()
+        .await;
+        assert!(react.is_err());
     }
 }

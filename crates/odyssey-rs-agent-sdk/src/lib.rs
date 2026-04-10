@@ -574,3 +574,177 @@ impl From<AgentSdkError> for String {
         value.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentSdkError, RunRequest, RunResponse, RunnableApp, block_on_future, host, run_app,
+        task_from_request,
+    };
+    use async_trait::async_trait;
+    use autoagents_core::agent::memory::{MemoryProvider, MemoryType};
+    use autoagents_core::tool::ToolInputT;
+    use autoagents_llm::chat::ChatMessage;
+    use autoagents_llm::error::LLMError;
+    use autoagents_protocol::Event;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use std::any::Any;
+
+    #[derive(Debug, Default)]
+    struct DummyMemory;
+
+    struct DummyToolArgs;
+
+    impl ToolInputT for DummyToolArgs {
+        fn io_schema() -> &'static str {
+            "{\"type\":\"object\"}"
+        }
+    }
+
+    #[async_trait]
+    impl MemoryProvider for DummyMemory {
+        async fn remember(&mut self, _message: &ChatMessage) -> Result<(), LLMError> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: Option<usize>,
+        ) -> Result<Vec<ChatMessage>, LLMError> {
+            Ok(Vec::new())
+        }
+
+        async fn clear(&mut self) -> Result<(), LLMError> {
+            Ok(())
+        }
+
+        fn memory_type(&self) -> MemoryType {
+            MemoryType::Custom
+        }
+
+        fn size(&self) -> usize {
+            0
+        }
+
+        fn clone_box(&self) -> Box<dyn MemoryProvider> {
+            Box::new(Self)
+        }
+    }
+
+    fn request() -> RunRequest {
+        RunRequest {
+            session_id: "session".to_string(),
+            turn_id: "turn".to_string(),
+            prompt: "hello".to_string(),
+            system_prompt: Some("stay concise".to_string()),
+            history_json: None,
+            metadata_json: Some(json!({ "attempt": 1 }).to_string()),
+            host_tools: Vec::new(),
+        }
+    }
+
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(message) => (*message).to_string(),
+                Err(_) => "unknown panic payload".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn task_from_request_preserves_prompt_and_optional_system_prompt() {
+        let task = task_from_request(&request());
+        assert_eq!(task.prompt, "hello");
+        assert_eq!(task.system_prompt, Some("stay concise".to_string()));
+    }
+
+    #[test]
+    fn block_on_future_runs_async_work_to_completion() {
+        let value = block_on_future(async { 40 + 2 });
+        assert_eq!(value, 42);
+    }
+
+    struct StubRunnable;
+
+    #[async_trait]
+    impl RunnableApp for StubRunnable {
+        async fn run(self, request: &RunRequest) -> super::AgentResult<RunResponse> {
+            Ok(RunResponse::text(format!("echo: {}", request.prompt)))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_app_executes_runnable_apps() {
+        let response = run_app(StubRunnable, &request()).await.expect("run app");
+        assert_eq!(response, RunResponse::text("echo: hello"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn non_wasm_host_bindings_return_unsupported_errors() {
+        let call_error = host::call_tool("Read", json!({}))
+            .await
+            .expect_err("host tool calls should fail outside wasm");
+        assert_eq!(
+            call_error.to_string(),
+            AgentSdkError::UnsupportedHostBuild.to_string()
+        );
+
+        let emit_error = host::emit_event(&Event::TaskComplete {
+            sub_id: uuid::Uuid::nil(),
+            actor_id: uuid::Uuid::nil(),
+            actor_name: "agent".to_string(),
+            result: "done".to_string(),
+        })
+        .expect_err("event emission should fail outside wasm");
+        assert_eq!(
+            emit_error.to_string(),
+            AgentSdkError::UnsupportedHostBuild.to_string()
+        );
+
+        let preload_error = host::preload_memory(&mut DummyMemory, &request())
+            .expect_err("memory preload should fail outside wasm");
+        assert_eq!(
+            preload_error.to_string(),
+            AgentSdkError::UnsupportedHostBuild.to_string()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn non_wasm_llm_provider_panics_with_clear_message() {
+        match std::panic::catch_unwind(host::llm_provider) {
+            Ok(_) => panic!("non-wasm llm provider should panic"),
+            Err(panic) => {
+                assert_eq!(
+                    panic_message(panic),
+                    "odyssey wasm host bindings are only available for wasm32 agents"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn non_wasm_tool_binding_panics_with_clear_message() {
+        match std::panic::catch_unwind(|| host::tool::<DummyToolArgs>("Read", "Read file")) {
+            Ok(_) => panic!("non-wasm tool binding should panic"),
+            Err(panic) => {
+                assert_eq!(
+                    panic_message(panic),
+                    "odyssey wasm host bindings are only available for wasm32 agents"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_sdk_errors_convert_into_strings() {
+        let error = AgentSdkError::HostTool("boom".to_string());
+        assert_eq!(String::from(error), "host tool call failed: boom");
+    }
+}

@@ -488,11 +488,109 @@ fn default_bundle_id(root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, build_runtime_config, default_bundle_id};
+    use super::{
+        Cli, Command, build_runtime_config, dangerous_sandbox_mode_enabled, default_bundle_id,
+        execute_command, handle_build, handle_bundles, handle_export, handle_import, handle_init,
+        handle_inspect, handle_session, handle_sessions, hub_override, remote_command_supported,
+        validate_remote_usage,
+    };
     use clap::Parser;
-    use odyssey_rs_protocol::SandboxMode;
+    use odyssey_rs_bundle::BundleStore;
+    use odyssey_rs_protocol::{DEFAULT_HUB_URL, SandboxMode, SessionSpec};
+    use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
     use pretty_assertions::assert_eq;
+    use std::fs;
     use std::path::Path;
+    use tempfile::tempdir;
+
+    fn runtime_config(root: &Path) -> RuntimeConfig {
+        RuntimeConfig {
+            cache_root: root.join("cache"),
+            session_root: root.join("sessions"),
+            sandbox_root: root.join("sandbox"),
+            bind_addr: "127.0.0.1:0".to_string(),
+            sandbox_mode_override: Some(SandboxMode::DangerFullAccess),
+            hub_url: DEFAULT_HUB_URL.to_string(),
+            worker_count: 2,
+            queue_capacity: 32,
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn write_bundle_project(root: &Path, bundle_id: &str, agent_id: &str) {
+        let agent_root = root.join("agents").join(agent_id);
+        fs::create_dir_all(root.join("skills").join("repo-hygiene")).expect("create skill dir");
+        fs::create_dir_all(root.join("resources").join("data")).expect("create data dir");
+        fs::create_dir_all(&agent_root).expect("create agent dir");
+        fs::write(
+            root.join("odyssey.bundle.yaml"),
+            format!(
+                r#"apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: {bundle_id}
+  version: 0.1.0
+  readme: README.md
+spec:
+  abiVersion: v1
+  skills:
+    - name: repo-hygiene
+      path: skills/repo-hygiene
+  tools:
+    - name: Read
+      source: builtin
+  sandbox:
+    permissions:
+      filesystem:
+        exec: []
+        mounts:
+          read: []
+          write: []
+      network: ["*"]
+    system_tools: ["sh"]
+    resources: {{}}
+  agents:
+    - id: {agent_id}
+      spec: agents/{agent_id}/agent.yaml
+      default: true
+"#
+            ),
+        )
+        .expect("write manifest");
+        fs::write(
+            agent_root.join("agent.yaml"),
+            format!(
+                r#"apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: {agent_id}
+  version: 0.1.0
+  description: test bundle
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: keep responses concise
+  model:
+    provider: openai
+    name: gpt-4.1-mini
+  tools:
+    allow: ["Read", "Skill"]
+"#
+            ),
+        )
+        .expect("write agent");
+        fs::write(root.join("README.md"), format!("# {bundle_id}\n")).expect("write readme");
+        fs::write(
+            root.join("skills").join("repo-hygiene").join("SKILL.md"),
+            "Keep commits focused.\n",
+        )
+        .expect("write skill");
+        fs::write(
+            root.join("resources").join("data").join("notes.txt"),
+            "hello world\n",
+        )
+        .expect("write resource");
+    }
 
     #[test]
     fn derives_bundle_id_from_cli_path() {
@@ -534,6 +632,462 @@ mod tests {
         assert_eq!(
             config.sandbox_mode_override,
             Some(SandboxMode::DangerFullAccess)
+        );
+    }
+
+    #[test]
+    fn validate_remote_usage_rejects_unsupported_commands() {
+        let cli = Cli {
+            remote: Some("127.0.0.1:4000".to_string()),
+            command: Command::Build {
+                path: ".".to_string(),
+                output: None,
+            },
+        };
+
+        let error = validate_remote_usage(&cli).expect_err("build should reject --remote");
+
+        assert_eq!(
+            error.to_string(),
+            "--remote is not supported with this command"
+        );
+    }
+
+    #[test]
+    fn validate_remote_usage_allows_supported_commands() {
+        let cli = Cli {
+            remote: Some("127.0.0.1:4000".to_string()),
+            command: Command::Inspect {
+                reference: "local/demo@0.1.0".to_string(),
+            },
+        };
+
+        assert!(validate_remote_usage(&cli).is_ok());
+    }
+
+    #[test]
+    fn serve_bind_takes_precedence_over_remote_bind_and_applies_danger_mode() {
+        let cli = Cli {
+            remote: Some("127.0.0.1:4000".to_string()),
+            command: Command::Serve {
+                bind: Some("127.0.0.1:5000".to_string()),
+                dangerous_sandbox_mode: true,
+            },
+        };
+
+        let config = build_runtime_config(&cli).expect("runtime config");
+
+        assert_eq!(config.bind_addr, "127.0.0.1:5000");
+        assert_eq!(
+            config.sandbox_mode_override,
+            Some(SandboxMode::DangerFullAccess)
+        );
+    }
+
+    #[test]
+    fn push_hub_override_updates_runtime_config() {
+        let cli = Cli {
+            remote: None,
+            command: Command::Push {
+                source: ".".to_string(),
+                to: "team/demo:0.1.0".to_string(),
+                hub: Some("https://hub.example.com".to_string()),
+            },
+        };
+
+        let config = build_runtime_config(&cli).expect("runtime config");
+
+        assert_eq!(config.hub_url, "https://hub.example.com");
+    }
+
+    #[test]
+    fn command_helpers_match_supported_subcommands() {
+        assert!(dangerous_sandbox_mode_enabled(&Command::Run {
+            reference: "local/demo@0.1.0".to_string(),
+            prompt: "hi".to_string(),
+            dangerous_sandbox_mode: true,
+        }));
+        assert!(dangerous_sandbox_mode_enabled(&Command::Serve {
+            bind: None,
+            dangerous_sandbox_mode: true,
+        }));
+        assert!(dangerous_sandbox_mode_enabled(&Command::Tui {
+            bundle: None,
+            cwd: None,
+            dangerous_sandbox_mode: true,
+        }));
+        assert!(!dangerous_sandbox_mode_enabled(&Command::Inspect {
+            reference: "local/demo@0.1.0".to_string(),
+        }));
+
+        assert!(remote_command_supported(&Command::Inspect {
+            reference: "local/demo@0.1.0".to_string(),
+        }));
+        assert!(remote_command_supported(&Command::Pull {
+            reference: "team/demo@1.0.0".to_string(),
+            hub: None,
+        }));
+        assert!(remote_command_supported(&Command::Session {
+            id: uuid::Uuid::nil(),
+            delete: false,
+        }));
+        assert!(!remote_command_supported(&Command::Export {
+            reference: "local/demo@0.1.0".to_string(),
+            output: None,
+        }));
+
+        assert_eq!(
+            hub_override(&Command::Pull {
+                reference: "team/demo@1.0.0".to_string(),
+                hub: Some("https://hub.example.com".to_string()),
+            }),
+            Some("https://hub.example.com".to_string())
+        );
+        assert_eq!(hub_override(&Command::Bundles), None);
+    }
+
+    #[test]
+    fn remote_bind_updates_runtime_config_for_supported_commands() {
+        let cli = Cli {
+            remote: Some("127.0.0.1:4900".to_string()),
+            command: Command::Inspect {
+                reference: "local/demo@0.1.0".to_string(),
+            },
+        };
+
+        let config = build_runtime_config(&cli).expect("runtime config");
+
+        assert_eq!(config.bind_addr, "127.0.0.1:4900");
+    }
+
+    #[test]
+    fn default_bundle_id_falls_back_and_collapses_repeated_separators() {
+        assert_eq!(default_bundle_id(Path::new("")), "hello-world");
+        assert_eq!(default_bundle_id(Path::new("./bundles/   ")), "hello-world");
+        assert_eq!(
+            default_bundle_id(Path::new("./bundles/Hello___World!!!")),
+            "hello-world"
+        );
+        assert_eq!(
+            default_bundle_id(Path::new("./bundles/...Rust   Agent---Beta...")),
+            "rust-agent-beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_handlers_manage_local_bundle_lifecycle() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let bundles = runtime.bundle_store();
+        let scaffold = temp.path().join("scaffold");
+
+        handle_init(&runtime, scaffold.to_str().expect("utf8 scaffold path")).expect("init");
+        assert!(scaffold.join("odyssey.bundle.yaml").exists());
+
+        let empty_store = BundleStore::new(temp.path().join("empty-cache"));
+        handle_bundles(&empty_store, None)
+            .await
+            .expect("list empty bundles");
+
+        let project = temp.path().join("alpha-project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+
+        let artifacts = temp.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        handle_build(
+            &bundles,
+            project.to_str().expect("utf8 project path"),
+            Some(artifacts.clone()),
+        )
+        .expect("build bundle archive");
+        assert!(
+            fs::read_dir(&artifacts)
+                .expect("list artifacts")
+                .next()
+                .is_some()
+        );
+
+        handle_build(&bundles, project.to_str().expect("utf8 project path"), None)
+            .expect("install bundle");
+        assert_eq!(
+            bundles.list_installed().expect("installed bundles").len(),
+            1
+        );
+
+        handle_bundles(&bundles, None)
+            .await
+            .expect("list installed bundles");
+        handle_inspect(&bundles, None, "local/alpha@0.1.0")
+            .await
+            .expect("inspect bundle");
+
+        let exports = temp.path().join("exports");
+        fs::create_dir_all(&exports).expect("create exports dir");
+        handle_export(&bundles, "local/alpha@0.1.0", Some(exports.clone())).expect("export");
+        let archive = fs::read_dir(&exports)
+            .expect("read exports dir")
+            .find_map(Result::ok)
+            .map(|entry| entry.path())
+            .expect("exported archive");
+
+        let imported_store = BundleStore::new(temp.path().join("import-cache"));
+        handle_import(&imported_store, archive).expect("import bundle");
+        assert_eq!(
+            imported_store
+                .list_installed()
+                .expect("imported bundles")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn session_handlers_list_show_and_delete_local_sessions() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let project = temp.path().join("alpha-project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+        runtime
+            .build_and_install(&project)
+            .expect("install bundle for sessions");
+
+        handle_sessions(&runtime, None)
+            .await
+            .expect("list empty sessions");
+
+        let session = runtime
+            .create_session(SessionSpec::from("local/alpha@0.1.0"))
+            .expect("create session");
+
+        handle_sessions(&runtime, None)
+            .await
+            .expect("list populated sessions");
+        handle_session(&runtime, None, session.id, false)
+            .await
+            .expect("show session");
+        handle_session(&runtime, None, session.id, true)
+            .await
+            .expect("delete session");
+        assert!(runtime.list_sessions(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_command_routes_local_bundle_and_session_variants() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let config = runtime.config().clone();
+        let bundles = runtime.bundle_store();
+        let scaffold = temp.path().join("scaffold");
+
+        execute_command(
+            Command::Init {
+                path: scaffold.to_str().expect("utf8 scaffold path").to_string(),
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch init");
+
+        let project = temp.path().join("alpha-project");
+        write_bundle_project(&project, "alpha", "alpha-agent");
+        let artifacts = temp.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        execute_command(
+            Command::Build {
+                path: project.to_str().expect("utf8 project path").to_string(),
+                output: Some(artifacts.clone()),
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch build artifact");
+
+        execute_command(
+            Command::Build {
+                path: project.to_str().expect("utf8 project path").to_string(),
+                output: None,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch build install");
+
+        execute_command(
+            Command::Inspect {
+                reference: "local/alpha@0.1.0".to_string(),
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch inspect");
+
+        let exports = temp.path().join("exports");
+        fs::create_dir_all(&exports).expect("create exports dir");
+        execute_command(
+            Command::Export {
+                reference: "local/alpha@0.1.0".to_string(),
+                output: Some(exports.clone()),
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch export");
+
+        execute_command(Command::Bundles, &config, &runtime, &bundles, None)
+            .await
+            .expect("dispatch bundles");
+
+        let session = runtime
+            .create_session(SessionSpec::from("local/alpha@0.1.0"))
+            .expect("create session");
+        execute_command(Command::Sessions, &config, &runtime, &bundles, None)
+            .await
+            .expect("dispatch sessions");
+        execute_command(
+            Command::Session {
+                id: session.id,
+                delete: false,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch show session");
+        execute_command(
+            Command::Session {
+                id: session.id,
+                delete: true,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            None,
+        )
+        .await
+        .expect("dispatch delete session");
+
+        let archive = fs::read_dir(&exports)
+            .expect("read exports dir")
+            .find_map(Result::ok)
+            .map(|entry| entry.path())
+            .expect("exported archive");
+        let imported_store = BundleStore::new(temp.path().join("import-cache"));
+        execute_command(
+            Command::Import { path: archive },
+            &config,
+            &runtime,
+            &imported_store,
+            None,
+        )
+        .await
+        .expect("dispatch import");
+    }
+
+    #[tokio::test]
+    async fn execute_command_surfaces_expected_errors_for_unavailable_variants() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let config = RuntimeConfig {
+            bind_addr: "not-an-address".to_string(),
+            ..runtime.config().clone()
+        };
+        let bundles = runtime.bundle_store();
+
+        assert!(
+            execute_command(
+                Command::Run {
+                    reference: "local/missing@0.1.0".to_string(),
+                    prompt: "hello".to_string(),
+                    dangerous_sandbox_mode: false,
+                },
+                &config,
+                &runtime,
+                &bundles,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(
+            execute_command(
+                Command::Serve {
+                    bind: None,
+                    dangerous_sandbox_mode: false,
+                },
+                &config,
+                &runtime,
+                &bundles,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(
+            execute_command(
+                Command::Push {
+                    source: temp.path().join("missing").display().to_string(),
+                    to: "team/demo@0.1.0".to_string(),
+                    hub: None,
+                },
+                &config,
+                &runtime,
+                &bundles,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(
+            execute_command(
+                Command::Pull {
+                    reference: "local/demo@0.1.0".to_string(),
+                    hub: None,
+                },
+                &config,
+                &runtime,
+                &bundles,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(
+            execute_command(
+                Command::Tui {
+                    // Keep this on the preflight error path so the test never
+                    // enters the real alternate-screen TUI.
+                    bundle: Some("local/missing@0.1.0".to_string()),
+                    cwd: None,
+                    dangerous_sandbox_mode: false,
+                },
+                &config,
+                &runtime,
+                &bundles,
+                None,
+            )
+            .await
+            .is_err()
         );
     }
 }

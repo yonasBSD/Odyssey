@@ -264,8 +264,9 @@ pub struct BashArgs {
 #[cfg(test)]
 mod tests {
     use super::{DynamicHostTool, HostToolCatalog, HostToolSpec, ReadArgs, RunRequest};
-    use autoagents_core::tool::ToolT;
+    use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
     use pretty_assertions::assert_eq;
+    use serde::Serialize;
     use serde_json::json;
 
     fn request() -> RunRequest {
@@ -323,6 +324,78 @@ mod tests {
         }
     }
 
+    fn full_request() -> RunRequest {
+        RunRequest {
+            session_id: "session".to_string(),
+            turn_id: "turn".to_string(),
+            prompt: "hello".to_string(),
+            system_prompt: None,
+            history_json: None,
+            metadata_json: None,
+            host_tools: vec![
+                HostToolSpec {
+                    name: "Read".to_string(),
+                    description: "Read".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Write".to_string(),
+                    description: "Write".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Edit".to_string(),
+                    description: "Edit".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "LS".to_string(),
+                    description: "List".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Glob".to_string(),
+                    description: "Glob".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Grep".to_string(),
+                    description: "Grep".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Skill".to_string(),
+                    description: "Skill".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+                HostToolSpec {
+                    name: "Bash".to_string(),
+                    description: "Bash".to_string(),
+                    args_schema: json!({"type": "object"}),
+                    output_schema: None,
+                },
+            ],
+        }
+    }
+
+    struct FailingArgs;
+
+    impl Serialize for FailingArgs {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("serialize boom"))
+        }
+    }
+
     #[test]
     fn catalog_exposes_runtime_selected_tools() {
         let catalog = HostToolCatalog::from_request(&request());
@@ -376,5 +449,127 @@ mod tests {
         assert_eq!(tool.description(), "Read a text file");
         assert_eq!(tool.args_schema(), spec.args_schema);
         assert_eq!(tool.output_schema(), spec.output_schema);
+    }
+
+    #[test]
+    fn standard_accessors_return_matching_typed_tools_when_present() {
+        let catalog = HostToolCatalog::from_request(&full_request());
+
+        assert_eq!(catalog.read().expect("Read").name(), "Read");
+        assert_eq!(catalog.write().expect("Write").name(), "Write");
+        assert_eq!(catalog.edit().expect("Edit").name(), "Edit");
+        assert_eq!(catalog.ls().expect("LS").name(), "LS");
+        assert_eq!(catalog.glob().expect("Glob").name(), "Glob");
+        assert_eq!(catalog.grep().expect("Grep").name(), "Grep");
+        assert_eq!(catalog.skill().expect("Skill").name(), "Skill");
+        assert_eq!(catalog.bash().expect("Bash").name(), "Bash");
+        assert!(catalog.tool("Missing").is_none());
+    }
+
+    #[test]
+    fn spec_and_tool_lookups_preserve_runtime_metadata() {
+        let catalog = HostToolCatalog::from_request(&full_request());
+
+        let spec = catalog.spec("Read").expect("spec lookup");
+        let dynamic = catalog.tool("Read").expect("dynamic tool");
+        let typed = catalog.read().expect("typed tool");
+
+        assert_eq!(dynamic.spec(), spec);
+        assert_eq!(typed.spec(), spec);
+        assert_eq!(
+            format!("{typed:?}"),
+            r#"TypedHostTool { name: "Read", description: "Read" }"#
+        );
+    }
+
+    #[tokio::test]
+    async fn host_tool_calls_surface_unsupported_host_errors_outside_wasm() {
+        let catalog = HostToolCatalog::from_request(&request());
+        let dynamic = catalog.tool("Read").expect("dynamic tool");
+        let typed = catalog.read().expect("typed tool");
+
+        let dynamic_error = dynamic
+            .call(json!({ "path": "README.md" }))
+            .await
+            .expect_err("dynamic call should fail outside wasm");
+        assert_eq!(
+            dynamic_error.to_string(),
+            "unsupported outside wasm agent execution"
+        );
+
+        let typed_error = typed
+            .call_value(ReadArgs {
+                path: "README.md".to_string(),
+            })
+            .await
+            .expect_err("typed call should fail outside wasm");
+        assert_eq!(
+            typed_error.to_string(),
+            "unsupported outside wasm agent execution"
+        );
+
+        let typed_result_error = typed
+            .call::<serde_json::Value>(ReadArgs {
+                path: "README.md".to_string(),
+            })
+            .await
+            .expect_err("typed result call should fail outside wasm");
+        assert_eq!(
+            typed_result_error.to_string(),
+            "unsupported outside wasm agent execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_host_tools_reject_unserializable_arguments() {
+        let spec = HostToolSpec {
+            name: "Read".to_string(),
+            description: "Read".to_string(),
+            args_schema: json!({"type": "object"}),
+            output_schema: None,
+        };
+        let tool = super::TypedHostTool::<FailingArgs>::new(spec);
+
+        let error = tool
+            .call_value(FailingArgs)
+            .await
+            .expect_err("serialization failure should surface");
+        assert_eq!(error.to_string(), "invalid request payload: serialize boom");
+    }
+
+    #[tokio::test]
+    async fn tool_runtime_execute_wraps_host_failures() {
+        let catalog = HostToolCatalog::from_request(&request());
+        let dynamic = catalog.tool("Read").expect("dynamic tool");
+        let typed = catalog.read().expect("typed tool");
+
+        let dynamic_error = dynamic
+            .execute(json!({ "path": "README.md" }))
+            .await
+            .expect_err("dynamic runtime call should fail outside wasm");
+        let typed_error = typed
+            .execute(json!({ "path": "README.md" }))
+            .await
+            .expect_err("typed runtime call should fail outside wasm");
+
+        match dynamic_error {
+            ToolCallError::RuntimeError(error) => {
+                assert_eq!(
+                    error.to_string(),
+                    "unsupported outside wasm agent execution"
+                );
+            }
+            other => panic!("unexpected dynamic error: {other}"),
+        }
+
+        match typed_error {
+            ToolCallError::RuntimeError(error) => {
+                assert_eq!(
+                    error.to_string(),
+                    "unsupported outside wasm agent execution"
+                );
+            }
+            other => panic!("unexpected typed error: {other}"),
+        }
     }
 }

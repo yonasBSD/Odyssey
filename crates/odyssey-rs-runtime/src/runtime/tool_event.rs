@@ -214,4 +214,43 @@ mod tests {
         assert!(approvals.resolve(request_id, ApprovalDecision::AllowOnce, sender));
         assert!(waiter.await.expect("join").is_ok());
     }
+
+    #[tokio::test]
+    async fn approval_handler_propagates_denied_decisions() {
+        let approvals = ApprovalStore::default();
+        let (sender, mut receiver) = broadcast::channel(8);
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let handler = RuntimeApprovalHandler {
+            session_id,
+            turn_id,
+            sender: sender.clone(),
+            approvals: approvals.clone(),
+        };
+
+        let waiter = tokio::spawn(async move { handler.request_tool_approval("Write").await });
+
+        let event = receiver.recv().await.expect("permission event");
+        let request_id = match event.payload {
+            EventPayload::PermissionRequested {
+                turn_id: got_turn_id,
+                request_id,
+                ..
+            } => {
+                assert_eq!(got_turn_id, turn_id);
+                request_id
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        };
+
+        assert!(approvals.resolve(request_id, ApprovalDecision::Deny, sender));
+        let error = waiter
+            .await
+            .expect("join")
+            .expect_err("approval should be denied");
+        assert_eq!(
+            error.to_string(),
+            "permission denied: tool Write was denied"
+        );
+    }
 }

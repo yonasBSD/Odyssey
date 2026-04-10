@@ -3054,6 +3054,7 @@ name = "odyssey-rs"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "crossterm",
  "env_logger",
@@ -3068,6 +3069,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -3098,6 +3100,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "wit-bindgen",
 ]
 

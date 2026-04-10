@@ -13,6 +13,13 @@ use std::io::{self, Stdout};
 const USER_ENV_VAR: &str = "USER";
 const USERNAME_ENV_VAR: &str = "USERNAME";
 
+fn resolve_user_name_from_env(
+    user: Result<String, std::env::VarError>,
+    username: Result<String, std::env::VarError>,
+) -> String {
+    user.or(username).unwrap_or_else(|_| "user".to_string())
+}
+
 /// Enter raw mode, switch to the alternate screen, and enable mouse capture.
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     debug!("setting up terminal");
@@ -39,7 +46,36 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> an
 
 /// Resolve the current UNIX user name, with a safe fallback.
 pub fn resolve_user_name() -> String {
-    std::env::var(USER_ENV_VAR)
-        .or_else(|_| std::env::var(USERNAME_ENV_VAR))
-        .unwrap_or_else(|_| "user".to_string())
+    resolve_user_name_from_env(std::env::var(USER_ENV_VAR), std::env::var(USERNAME_ENV_VAR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_user_name_from_env;
+    use pretty_assertions::assert_eq;
+    use std::env::VarError;
+
+    #[test]
+    fn resolve_user_name_prefers_user_env_var() {
+        assert_eq!(
+            resolve_user_name_from_env(Ok("alice".to_string()), Ok("bob".to_string())),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn resolve_user_name_falls_back_to_username_env_var() {
+        assert_eq!(
+            resolve_user_name_from_env(Err(VarError::NotPresent), Ok("bob".to_string())),
+            "bob"
+        );
+    }
+
+    #[test]
+    fn resolve_user_name_uses_default_when_env_is_missing() {
+        assert_eq!(
+            resolve_user_name_from_env(Err(VarError::NotPresent), Err(VarError::NotPresent)),
+            "user"
+        );
+    }
 }

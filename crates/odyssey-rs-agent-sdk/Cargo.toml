@@ -30,3 +30,4 @@ wit-bindgen = "0.51.0"
 odyssey-rs-protocol.workspace = true
 pretty_assertions.workspace = true
 tokio.workspace = true
+uuid.workspace = true
