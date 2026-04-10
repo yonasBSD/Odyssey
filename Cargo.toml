@@ -71,11 +71,23 @@ tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 walkdir = "2.5.0"
 which = "8.0.2"
-wasmtime = "42.0.1"
-wasmtime-wasi = "42.0.1"
+wasmtime = "43.0.1"
+wasmtime-wasi = "43.0.1"
 wasmparser = "0.245.1"
 env_logger = "0.11.9"
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"
 tera = "1.20.1"
 libc = "0.2.183"
+
+[profile.release]
+lto = "thin"      # Enable link-time optimization
+codegen-units = 1 # Better optimization (slower compile)
+
+# Separate profile for profiling (keeps release fast)
+[profile.profiling]
+inherits = "release"
+debug = true         # Full debug info for symbols
+
+[profile.bench]
+debug = true
