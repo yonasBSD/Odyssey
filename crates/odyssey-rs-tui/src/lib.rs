@@ -31,15 +31,15 @@ pub struct TuiRunConfig {
     pub cwd: Option<PathBuf>,
 }
 
-/// Launch the Odyssey TUI against a pre-configured [`OdysseyRuntime`].
-pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::Result<()> {
+async fn initialize_app(
+    client: &AgentRuntimeClient,
+    bundle_store: &BundleStore,
+    config: TuiRunConfig,
+) -> anyhow::Result<App> {
     let TuiRunConfig { bundle_ref, cwd } = config;
     let cwd = cwd
-        .clone()
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| anyhow!("cannot determine working directory"))?;
-    let client = Arc::new(AgentRuntimeClient::new(runtime.clone(), bundle_ref.clone()));
-    let bundle_store = BundleStore::new(runtime.config().cache_root.clone());
     let mut app = App {
         bundle_ref,
         ..App::default()
@@ -62,27 +62,40 @@ pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::
                 .to_string(),
         );
         app.push_status("install a local bundle to get started");
-    } else {
-        let bundle = bundle_store.resolve(&app.bundle_ref)?.metadata;
-        app.set_active_agent(bundle.agent_spec.id.clone());
-
-        let agents = client.list_agents().await?;
-        if agents.is_empty() {
-            return Err(anyhow!("no agents available in bundle {}", app.bundle_ref));
-        }
-        debug!("loaded agents (count={})", agents.len());
-        app.set_agents(agents);
-
-        if let Ok(sessions) = client.list_sessions().await {
-            app.set_sessions(sessions);
-        }
-        if let Ok(skills) = client.list_skills().await {
-            app.set_skills(skills);
-        }
-        let mut models = client.list_models().await?;
-        models.sort();
-        app.set_models(models);
+        return Ok(app);
     }
+
+    let bundle = bundle_store.resolve(&app.bundle_ref)?.metadata;
+    app.set_active_agent(bundle.agent_spec.id.clone());
+
+    let agents = client.list_agents().await?;
+    if agents.is_empty() {
+        return Err(anyhow!("no agents available in bundle {}", app.bundle_ref));
+    }
+    debug!("loaded agents (count={})", agents.len());
+    app.set_agents(agents);
+
+    if let Ok(sessions) = client.list_sessions().await {
+        app.set_sessions(sessions);
+    }
+    if let Ok(skills) = client.list_skills().await {
+        app.set_skills(skills);
+    }
+    let mut models = client.list_models().await?;
+    models.sort();
+    app.set_models(models);
+
+    Ok(app)
+}
+
+/// Launch the Odyssey TUI against a pre-configured [`OdysseyRuntime`].
+pub async fn run(runtime: Arc<OdysseyRuntime>, config: TuiRunConfig) -> anyhow::Result<()> {
+    let client = Arc::new(AgentRuntimeClient::new(
+        runtime.clone(),
+        config.bundle_ref.clone(),
+    ));
+    let bundle_store = BundleStore::new(runtime.config().cache_root.clone());
+    let mut app = initialize_app(client.as_ref(), &bundle_store, config).await?;
 
     let mut terminal = terminal::setup_terminal()?;
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
@@ -130,13 +143,16 @@ fn bundle_summary_ref(bundle: BundleInstallSummary) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiRunConfig, bundle_summary_ref, resolve_bundle_ref};
+    use super::{TuiRunConfig, bundle_summary_ref, initialize_app, resolve_bundle_ref};
+    use crate::app::ViewerKind;
+    use crate::client::AgentRuntimeClient;
     use odyssey_rs_bundle::BundleInstallSummary;
     use odyssey_rs_protocol::DEFAULT_HUB_URL;
-    use odyssey_rs_runtime::{RuntimeConfig, RuntimeEngine};
+    use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig, RuntimeEngine};
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn runtime_config(root: &Path) -> RuntimeConfig {
@@ -278,5 +294,72 @@ spec:
             "team/demo@1.2.3"
         );
         assert_eq!(TuiRunConfig::default().bundle_ref, "");
+    }
+
+    #[tokio::test]
+    async fn initialize_app_shows_bundle_install_guidance_when_no_bundle_is_selected() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime"));
+        let client = AgentRuntimeClient::new(runtime.clone(), String::default());
+        let bundle_store = runtime.bundle_store();
+        let cwd = temp.path().join("workspace");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let app = initialize_app(
+            &client,
+            &bundle_store,
+            TuiRunConfig {
+                bundle_ref: String::default(),
+                cwd: Some(cwd.clone()),
+            },
+        )
+        .await
+        .expect("initialize app");
+
+        assert_eq!(app.viewer, Some(ViewerKind::Bundles));
+        assert_eq!(app.cwd, cwd.display().to_string());
+        assert_eq!(app.status, "install a local bundle to get started");
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "No bundles are installed. Use /bundle install <path> to install a local bundle."
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_app_loads_bundle_agents_skills_and_models() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime"));
+        let project = temp.path().join("alpha-project");
+        fs::create_dir_all(&project).expect("create project");
+        write_bundle_project(&project, "alpha");
+        runtime.build_and_install(&project).expect("install bundle");
+        let client = AgentRuntimeClient::new(runtime.clone(), "local/alpha@0.1.0".to_string());
+        let bundle_store = runtime.bundle_store();
+
+        let app = initialize_app(
+            &client,
+            &bundle_store,
+            TuiRunConfig {
+                bundle_ref: "local/alpha@0.1.0".to_string(),
+                cwd: None,
+            },
+        )
+        .await
+        .expect("initialize app");
+
+        assert_eq!(app.bundle_ref, "local/alpha@0.1.0");
+        assert_eq!(app.active_agent, Some("alpha".to_string()));
+        assert_eq!(app.agents, vec!["alpha".to_string()]);
+        assert_eq!(app.skills.len(), 1);
+        assert_eq!(app.models, vec!["gpt-4.1-mini".to_string()]);
+        assert_eq!(
+            app.cwd,
+            std::env::current_dir()
+                .expect("current dir")
+                .display()
+                .to_string()
+        );
+        assert!(app.viewer.is_none());
     }
 }

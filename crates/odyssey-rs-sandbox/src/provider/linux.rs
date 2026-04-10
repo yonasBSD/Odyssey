@@ -382,9 +382,18 @@ pub(crate) fn append_runtime_support_mounts(args: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_etc_mounts, append_mount, append_runtime_support_mounts};
-    use crate::provider::Mount;
+    use super::{
+        BubblewrapProvider, append_command_mount_if_needed, append_etc_mounts, append_mount,
+        append_runtime_support_mounts, apply_rlimits, path_is_mounted,
+    };
+    use crate::provider::{Mount, build_prepared_sandbox};
+    use crate::{
+        AccessDecision, AccessMode, CommandSpec, SandboxContext, SandboxHandle, SandboxPolicy,
+        SandboxProvider,
+    };
+    use odyssey_rs_protocol::SandboxMode;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -466,5 +475,145 @@ mod tests {
                 window[0] == "--ro-bind" && window[1] == dir && window[2] == dir
             }));
         }
+    }
+
+    #[test]
+    fn dependency_report_mentions_missing_bwrap_and_namespace_state() {
+        let report = BubblewrapProvider::dependency_report_linux();
+
+        if which::which("bwrap").is_err() {
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|message| message.contains("bwrap"))
+            );
+        }
+        if !Path::new("/proc/self/ns").exists() {
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|message| message.contains("namespaces"))
+            );
+        }
+    }
+
+    #[test]
+    fn append_command_mount_if_needed_only_binds_unmounted_absolute_commands() {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let external_root = temp.path().join("external");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&external_root).expect("create external root");
+        let executable = external_root.join("demo.sh");
+        std::fs::write(&executable, "#!/bin/sh\n").expect("write executable");
+        let ctx = SandboxContext {
+            workspace_root: workspace_root.clone(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared sandbox");
+        let mut args = Vec::new();
+
+        append_command_mount_if_needed(&mut args, &prepared, &executable).expect("append mount");
+
+        assert_eq!(
+            args,
+            vec![
+                "--ro-bind".to_string(),
+                executable.display().to_string(),
+                executable.display().to_string(),
+            ]
+        );
+
+        let mut mounted = prepared.clone();
+        mounted.mounts.push(Mount {
+            source: external_root.clone(),
+            target: external_root,
+            writable: false,
+        });
+        let mut skipped = Vec::new();
+        append_command_mount_if_needed(&mut skipped, &mounted, &executable)
+            .expect("mounted command skipped");
+        assert!(skipped.is_empty());
+        assert!(path_is_mounted(Path::new("/etc/hosts"), &prepared));
+    }
+
+    #[test]
+    fn provider_state_methods_handle_known_and_unknown_handles() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared sandbox");
+        let handle = SandboxHandle {
+            id: uuid::Uuid::new_v4(),
+        };
+        let provider = BubblewrapProvider {
+            bwrap_path: Path::new("/bin/true").to_path_buf(),
+            state: parking_lot::RwLock::new(HashMap::from([(handle.id, prepared)])),
+        };
+
+        assert_eq!(
+            provider.check_access(&handle, temp.path(), AccessMode::Read),
+            AccessDecision::Allow
+        );
+        let report = provider.dependency_report();
+        let expected = BubblewrapProvider::dependency_report_linux();
+        assert_eq!(report.errors, expected.errors);
+        assert_eq!(report.warnings, expected.warnings);
+        provider.shutdown(handle.clone());
+        assert!(matches!(
+            provider.check_access(&handle, temp.path(), AccessMode::Read),
+            AccessDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn spawn_command_rejects_unknown_handles() {
+        let provider = BubblewrapProvider {
+            bwrap_path: Path::new("/bin/true").to_path_buf(),
+            state: parking_lot::RwLock::new(HashMap::new()),
+        };
+
+        let error = provider
+            .spawn_command(
+                &SandboxHandle {
+                    id: uuid::Uuid::new_v4(),
+                },
+                CommandSpec::new("sh"),
+            )
+            .expect_err("unknown handle should fail");
+
+        assert!(error.to_string().contains("unknown sandbox handle"));
+    }
+
+    #[tokio::test]
+    async fn run_command_streaming_rejects_unknown_handles() {
+        let provider = BubblewrapProvider {
+            bwrap_path: Path::new("/bin/true").to_path_buf(),
+            state: parking_lot::RwLock::new(HashMap::new()),
+        };
+
+        let error = provider
+            .run_command_streaming(
+                &SandboxHandle {
+                    id: uuid::Uuid::new_v4(),
+                },
+                CommandSpec::new("sh"),
+                &mut crate::provider::BufferingSink::default(),
+            )
+            .await
+            .expect_err("unknown handle should fail");
+
+        assert!(error.to_string().contains("unknown sandbox handle"));
+    }
+
+    #[test]
+    fn apply_rlimits_with_default_limits_is_a_noop() {
+        apply_rlimits(&crate::SandboxLimits::default()).expect("default limits should not fail");
     }
 }

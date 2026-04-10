@@ -264,7 +264,7 @@ mod tests {
     use super::router;
     use crate::app::AppState;
     use axum::body::{Body, to_bytes};
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode, header::CONTENT_TYPE};
     use odyssey_rs_protocol::{DEFAULT_HUB_URL, SandboxMode};
     use odyssey_rs_runtime::{RuntimeConfig, RuntimeEngine};
     use pretty_assertions::assert_eq;
@@ -732,7 +732,7 @@ spec:
         )
         .await;
         let ran = text_response(
-            app,
+            app.clone(),
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/sessions/{missing_session}/run-sync"))
@@ -749,10 +749,21 @@ spec:
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
+        let events = text_response(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/sessions/{missing_session}/events"))
+                .body(Body::empty())
+                .expect("events request"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
 
         assert!(fetched.contains("session not found"));
         assert!(deleted.contains("session not found"));
         assert!(ran.contains("session not found"));
+        assert!(events.contains("session not found"));
     }
 
     #[tokio::test]
@@ -783,5 +794,71 @@ spec:
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn run_route_accepts_turns_and_events_route_returns_sse_for_existing_sessions() {
+        let temp = tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        write_bundle_project(&project_root);
+
+        let runtime = Arc::new(RuntimeEngine::new(runtime_config(temp.path())).expect("runtime"));
+        runtime
+            .build_and_install(&project_root)
+            .expect("install bundle");
+        let session = runtime
+            .create_session(odyssey_rs_protocol::SessionSpec::from("demo@0.1.0"))
+            .expect("create session");
+        let app = router(AppState {
+            runtime: runtime.clone(),
+            bundles: runtime.bundle_store(),
+            hub_url: runtime.config().hub_url.clone(),
+        });
+
+        let accepted = json_response(
+            app.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/sessions/{}/run", session.id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "input": serde_json::to_value(
+                            odyssey_rs_protocol::Task::new("hello from route")
+                        )
+                        .expect("serialize task")
+                    }))
+                    .expect("serialize run request"),
+                ))
+                .expect("run request"),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(accepted["session_id"], session.id.to_string());
+        assert!(
+            Uuid::parse_str(accepted["turn_id"].as_str().expect("turn id")).is_ok(),
+            "turn id should be a UUID"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/sessions/{}/events", session.id))
+                    .body(Body::empty())
+                    .expect("events request"),
+            )
+            .await
+            .expect("events response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
     }
 }

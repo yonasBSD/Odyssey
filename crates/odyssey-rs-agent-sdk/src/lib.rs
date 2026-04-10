@@ -578,18 +578,30 @@ impl From<AgentSdkError> for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSdkError, RunRequest, RunResponse, RunnableApp, block_on_future, host, run_app,
-        task_from_request,
+        AgentSdkError, RunRequest, RunResponse, block_on_future, build_and_run, host, run_app,
+        run_handle, task_from_request,
     };
     use async_trait::async_trait;
     use autoagents_core::agent::memory::{MemoryProvider, MemoryType};
+    use autoagents_core::agent::task::Task;
+    use autoagents_core::agent::{
+        AgentBuilder, AgentDeriveT, AgentExecutor, AgentHooks, Context, DirectAgent,
+        ExecutorConfig, HookOutcome,
+    };
     use autoagents_core::tool::ToolInputT;
+    use autoagents_llm::LLMProvider;
     use autoagents_llm::chat::ChatMessage;
+    use autoagents_llm::chat::{ChatProvider, ChatResponse, StructuredOutputFormat};
+    use autoagents_llm::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use autoagents_llm::embedding::EmbeddingProvider;
     use autoagents_llm::error::LLMError;
+    use autoagents_llm::models::{ModelListRequest, ModelListResponse, ModelsProvider};
     use autoagents_protocol::Event;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::any::Any;
+    use std::fmt;
+    use std::sync::Arc;
 
     #[derive(Debug, Default)]
     struct DummyMemory;
@@ -671,9 +683,124 @@ mod tests {
     struct StubRunnable;
 
     #[async_trait]
-    impl RunnableApp for StubRunnable {
+    impl super::RunnableApp for StubRunnable {
         async fn run(self, request: &RunRequest) -> super::AgentResult<RunResponse> {
             Ok(RunResponse::text(format!("echo: {}", request.prompt)))
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct NoopLlm;
+
+    #[derive(Debug)]
+    struct EmptyChatResponse;
+
+    impl fmt::Display for EmptyChatResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("")
+        }
+    }
+
+    impl ChatResponse for EmptyChatResponse {
+        fn text(&self) -> Option<String> {
+            Some(String::default())
+        }
+
+        fn tool_calls(&self) -> Option<Vec<autoagents_llm::ToolCall>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for NoopLlm {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            Ok(Box::new(EmptyChatResponse))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for NoopLlm {
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<CompletionResponse, LLMError> {
+            Ok(CompletionResponse {
+                text: String::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for NoopLlm {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ModelsProvider for NoopLlm {
+        async fn list_models(
+            &self,
+            _request: Option<&ModelListRequest>,
+        ) -> Result<Box<dyn ModelListResponse>, LLMError> {
+            Err(LLMError::ProviderError("unused in tests".to_string()))
+        }
+    }
+
+    impl LLMProvider for NoopLlm {}
+
+    #[derive(Clone, Debug, Default)]
+    struct EchoAgent;
+
+    #[async_trait]
+    impl AgentDeriveT for EchoAgent {
+        type Output = String;
+
+        fn description(&self) -> &str {
+            "echo agent"
+        }
+
+        fn output_schema(&self) -> Option<serde_json::Value> {
+            Some(json!({ "type": "string" }))
+        }
+
+        fn name(&self) -> &str {
+            "echo-agent"
+        }
+
+        fn tools(&self) -> Vec<Box<dyn autoagents_core::tool::ToolT>> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait]
+    impl AgentExecutor for EchoAgent {
+        type Output = String;
+        type Error = LLMError;
+
+        fn config(&self) -> ExecutorConfig {
+            ExecutorConfig::default()
+        }
+
+        async fn execute(
+            &self,
+            task: &Task,
+            _context: Arc<Context>,
+        ) -> Result<Self::Output, Self::Error> {
+            Ok(format!("executed: {}", task.prompt))
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for EchoAgent {
+        async fn on_run_start(&self, _task: &Task, _ctx: &Context) -> HookOutcome {
+            HookOutcome::Continue
         }
     }
 
@@ -681,6 +808,50 @@ mod tests {
     async fn run_app_executes_runnable_apps() {
         let response = run_app(StubRunnable, &request()).await.expect("run app");
         assert_eq!(response, RunResponse::text("echo: hello"));
+    }
+
+    #[tokio::test]
+    async fn run_handle_executes_direct_agent_handles() {
+        let handle = AgentBuilder::<_, DirectAgent>::new(EchoAgent)
+            .llm(Arc::new(NoopLlm))
+            .build()
+            .await
+            .expect("build direct handle");
+
+        let response = run_handle(handle, &request()).await.expect("run handle");
+
+        assert_eq!(response, RunResponse::text("executed: hello"));
+    }
+
+    #[tokio::test]
+    async fn build_and_run_delegates_to_the_handle_builder() {
+        let response = build_and_run::<EchoAgent, _, _, _>(&request(), |_| async {
+            AgentBuilder::<_, DirectAgent>::new(EchoAgent)
+                .llm(Arc::new(NoopLlm))
+                .build()
+                .await
+                .map_err(|err| err.to_string())
+        })
+        .await
+        .expect("build and run");
+
+        assert_eq!(response, RunResponse::text("executed: hello"));
+    }
+
+    #[tokio::test]
+    async fn build_and_run_wraps_builder_failures() {
+        let error = build_and_run::<EchoAgent, _, _, _>(&request(), |_| async {
+            Err::<autoagents_core::agent::DirectAgentHandle<EchoAgent>, _>(std::io::Error::other(
+                "builder failed",
+            ))
+        })
+        .await
+        .expect_err("builder failure should be wrapped");
+
+        assert_eq!(
+            error.to_string(),
+            AgentSdkError::Execution("builder failed".to_string()).to_string()
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

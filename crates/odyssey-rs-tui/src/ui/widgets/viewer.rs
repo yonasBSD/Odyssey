@@ -438,3 +438,229 @@ fn render_theme_lines(app: &App) -> Vec<Line<'static>> {
 
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AVAILABLE_THEMES, draw_viewer, draw_viewer_footer, render_agent_lines, render_bundle_lines,
+        render_model_lines, render_session_lines, render_skill_lines, render_theme_lines,
+    };
+    use crate::app::{App, ViewerKind};
+    use chrono::Utc;
+    use odyssey_rs_bundle::BundleInstallSummary;
+    use odyssey_rs_protocol::{SessionSummary, SkillSummary};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn base_app() -> App {
+        let session_id = Uuid::new_v4();
+        App {
+            bundle_ref: "local/demo@0.1.0".to_string(),
+            active_session: Some(session_id),
+            active_agent: Some("beta".to_string()),
+            model_id: "gpt-4.1".to_string(),
+            models: vec!["gpt-4.1-mini".to_string(), "gpt-4.1".to_string()],
+            agents: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            bundles: vec![
+                BundleInstallSummary {
+                    namespace: "local".to_string(),
+                    id: "demo".to_string(),
+                    version: "0.1.0".to_string(),
+                    path: PathBuf::from("/bundles/demo"),
+                },
+                BundleInstallSummary {
+                    namespace: "team".to_string(),
+                    id: "ops".to_string(),
+                    version: "1.2.3".to_string(),
+                    path: PathBuf::from("/bundles/ops"),
+                },
+            ],
+            sessions: vec![
+                SessionSummary {
+                    id: Uuid::new_v4(),
+                    agent_id: "alpha".to_string(),
+                    message_count: 1,
+                    created_at: Utc::now(),
+                },
+                SessionSummary {
+                    id: session_id,
+                    agent_id: "beta".to_string(),
+                    message_count: 3,
+                    created_at: Utc::now(),
+                },
+                SessionSummary {
+                    id: Uuid::new_v4(),
+                    agent_id: "gamma".to_string(),
+                    message_count: 5,
+                    created_at: Utc::now(),
+                },
+            ],
+            skills: vec![
+                SkillSummary {
+                    name: "repo-hygiene".to_string(),
+                    description: "Keep repositories clean".to_string(),
+                    path: PathBuf::from("/"),
+                },
+                SkillSummary {
+                    name: "review".to_string(),
+                    description: "Review code changes".to_string(),
+                    path: PathBuf::from("skills/review/SKILL.md"),
+                },
+            ],
+            selected_session: 0,
+            selected_agent: 1,
+            selected_bundle: 1,
+            selected_model: 1,
+            selected_theme: 1,
+            theme: AVAILABLE_THEMES[1],
+            ..App::default()
+        }
+    }
+
+    fn flatten(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render_overlay(app: &mut App, height: u16) -> String {
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        terminal
+            .draw(|frame| draw_viewer(frame, app, frame.area()))
+            .expect("draw overlay");
+        format!("{}", terminal.backend())
+    }
+
+    fn render_footer(app: &App) -> String {
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        terminal
+            .draw(|frame| draw_viewer_footer(frame, app, frame.area()))
+            .expect("draw footer");
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn viewer_line_helpers_cover_empty_states() {
+        let app = App::default();
+
+        assert_eq!(
+            flatten(&render_session_lines(&app)),
+            vec![" No sessions found. Use /new to create one.".to_string()]
+        );
+        assert_eq!(
+            flatten(&render_agent_lines(&app)),
+            vec![" No agents found in the current bundle.".to_string()]
+        );
+        assert_eq!(
+            flatten(&render_bundle_lines(&app)),
+            vec![" No installed bundles found in ~/.odyssey/bundles.".to_string()]
+        );
+        assert_eq!(
+            flatten(&render_skill_lines(&app)),
+            vec![" No skills configured.".to_string()]
+        );
+        assert_eq!(
+            flatten(&render_model_lines(&app)),
+            vec![" No models registered.".to_string()]
+        );
+    }
+
+    #[test]
+    fn viewer_line_helpers_cover_selected_active_and_preview_states() {
+        let app = base_app();
+
+        assert!(
+            flatten(&render_session_lines(&app))
+                .iter()
+                .any(|line| line.contains(">  ") && line.contains("alpha"))
+        );
+        assert!(
+            flatten(&render_session_lines(&app))
+                .iter()
+                .any(|line| line.contains(" * ") && line.contains("beta"))
+        );
+        assert!(
+            flatten(&render_agent_lines(&app))
+                .iter()
+                .any(|line| line.contains("beta") && line.contains("(active)"))
+        );
+        assert!(
+            flatten(&render_bundle_lines(&app))
+                .iter()
+                .any(|line| line.contains("team/ops@1.2.3") && line.contains("/bundles/ops"))
+        );
+        assert!(
+            flatten(&render_skill_lines(&app))
+                .iter()
+                .any(|line| line.trim() == "/")
+        );
+        assert!(
+            flatten(&render_model_lines(&app))
+                .iter()
+                .any(|line| line.contains("gpt-4.1") && line.contains("(active)"))
+        );
+        assert!(
+            flatten(&render_theme_lines(&app))
+                .iter()
+                .any(|line| line.contains(AVAILABLE_THEMES[1].name) && line.contains("(active)"))
+        );
+    }
+
+    #[test]
+    fn draw_viewer_is_noop_when_closed_and_footer_uses_contextual_hints() {
+        let mut app = App {
+            viewer_scroll: 7,
+            viewer_max_scroll: 11,
+            ..App::default()
+        };
+
+        let rendered = render_overlay(&mut app, 8);
+        let blank_line = format!("\"{}\"", " ".repeat(100));
+        assert_eq!(rendered.lines().count(), 8);
+        assert!(rendered.lines().all(|line| line == blank_line));
+        assert_eq!(app.viewer_scroll, 7);
+        assert_eq!(app.viewer_max_scroll, 11);
+
+        app.viewer = Some(ViewerKind::Skills);
+        assert!(render_footer(&app).contains("Esc to close"));
+        app.viewer = Some(ViewerKind::Themes);
+        assert!(render_footer(&app).contains("Up/Down to navigate"));
+    }
+
+    #[test]
+    fn draw_viewer_updates_scroll_bounds_and_renders_each_overlay_variant() {
+        let mut app = base_app();
+        app.skills = (0..8)
+            .map(|idx| SkillSummary {
+                name: format!("skill-{idx}"),
+                description: "Scrollable skill".to_string(),
+                path: PathBuf::from(format!("skills/{idx}/SKILL.md")),
+            })
+            .collect();
+
+        for kind in [
+            ViewerKind::Sessions,
+            ViewerKind::Agents,
+            ViewerKind::Bundles,
+            ViewerKind::Models,
+            ViewerKind::Themes,
+            ViewerKind::Skills,
+        ] {
+            app.viewer = Some(kind);
+            let rendered = render_overlay(&mut app, 8);
+            assert!(!rendered.trim().is_empty());
+        }
+
+        assert!(app.viewer_max_scroll > 0);
+    }
+}

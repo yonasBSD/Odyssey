@@ -443,9 +443,12 @@ fn ensure_absolute_mount(root: &Path, value: &str, label: &str) -> Result<(), Ma
 }
 
 fn is_current_directory_mount(path: &Path) -> bool {
-    let mut components = path.components();
-    components.next().is_some()
-        && components.all(|component| component == std::path::Component::CurDir)
+    let mut saw_component = false;
+    let all_current = path.components().all(|component| {
+        saw_component = true;
+        component == std::path::Component::CurDir
+    });
+    saw_component && all_current
 }
 
 fn canonicalize_root(root: &Path) -> Result<PathBuf, ManifestError> {
@@ -488,10 +491,63 @@ fn invalid_path(root: &Path, message: &str) -> Result<PathBuf, ManifestError> {
 
 #[cfg(test)]
 mod tests {
-    use super::BundleLoader;
-    use crate::AgentKind;
+    use super::{
+        BundleLoader, canonicalize_root, ensure_absolute_mount, ensure_relative_entry,
+        ensure_relative_file, validate_optional_schema, validate_sandbox, validate_wasm_component,
+    };
+    use crate::{
+        AgentKind, AgentSpec, BundleAgentEntry, BundleDescriptor, BundleManifest, BundleSandbox,
+        BundleSkill, ManifestVersion,
+    };
+    use odyssey_rs_protocol::ModelSpec;
     use pretty_assertions::assert_eq;
     use std::fs;
+
+    fn bundle_entry(id: &str, default: bool) -> BundleAgentEntry {
+        BundleAgentEntry {
+            id: id.to_string(),
+            spec: format!("agents/{id}/agent.yaml"),
+            module: None,
+            default,
+        }
+    }
+
+    fn base_manifest(agents: Vec<BundleAgentEntry>) -> BundleManifest {
+        BundleManifest {
+            manifest_version: ManifestVersion::V1,
+            api_version: "odyssey.ai/bundle.v1".to_string(),
+            kind: "AgentBundle".to_string(),
+            id: "demo".to_string(),
+            version: "0.2.0".to_string(),
+            abi_version: "v1".to_string(),
+            readme: "README.md".to_string(),
+            agent_spec: agents
+                .first()
+                .map(|entry| entry.spec.clone())
+                .unwrap_or_default(),
+            executor: crate::BundleExecutor::default(),
+            memory: crate::BundleMemory::default(),
+            skills: Vec::new(),
+            tools: Vec::new(),
+            sandbox: BundleSandbox::default(),
+            signatures: crate::BundleSignatures::default(),
+            agents,
+        }
+    }
+
+    fn prompt_agent(id: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.to_string(),
+            name: id.to_string(),
+            prompt: "stay concise".to_string(),
+            model: ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-4.1-mini".to_string(),
+                config: None,
+            },
+            ..AgentSpec::default()
+        }
+    }
 
     #[test]
     fn load_project_normalizes_bundle_and_agents() {
@@ -608,6 +664,419 @@ spec:
                 agent_dir.join("module.wasm").display(),
                 agent_dir.join("module.wasm").display()
             )
+        );
+    }
+
+    #[test]
+    fn load_project_rejects_wasm_agents_without_any_entrypoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agents").join("reviewer");
+        fs::create_dir_all(&agent_dir).expect("mkdir");
+        fs::write(temp.path().join("README.md"), "# Demo\n").expect("readme");
+        fs::write(
+            temp.path().join("odyssey.bundle.yaml"),
+            r#"
+apiVersion: odyssey.ai/bundle.v1
+kind: AgentBundle
+metadata:
+  name: demo
+  version: 0.2.0
+spec:
+  abiVersion: v1
+  agents:
+    - id: reviewer
+      spec: agents/reviewer/agent.yaml
+"#,
+        )
+        .expect("bundle");
+        fs::write(
+            agent_dir.join("agent.yaml"),
+            r#"
+apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: reviewer
+  version: 0.2.0
+spec:
+  kind: wasm
+  abiVersion: v1
+  program:
+    runner_class: wasm-component
+"#,
+        )
+        .expect("agent");
+
+        let error = BundleLoader::new(temp.path())
+            .load_project()
+            .expect_err("missing entrypoint should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid manifest at {}: wasm agents require program.entrypoint or bundle.spec.agents[].module",
+                agent_dir.join("agent.yaml").display()
+            )
+        );
+    }
+
+    #[test]
+    fn bundle_and_agent_loaders_surface_io_and_yaml_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let loader = BundleLoader::new(temp.path());
+        let missing_bundle = temp.path().join("missing.bundle.yaml");
+        let missing_agent = temp.path().join("missing.agent.yaml");
+
+        let bundle_io = loader
+            .load_bundle_manifest(&missing_bundle)
+            .expect_err("missing bundle should fail");
+        assert!(matches!(bundle_io, crate::ManifestError::Io { .. }));
+        assert!(bundle_io.to_string().contains("missing.bundle.yaml"));
+
+        let invalid_bundle = temp.path().join("invalid.bundle.yaml");
+        fs::write(&invalid_bundle, "not: [valid").expect("write invalid bundle");
+        let bundle_yaml = loader
+            .load_bundle_manifest(&invalid_bundle)
+            .expect_err("invalid bundle yaml should fail");
+        assert!(matches!(
+            bundle_yaml,
+            crate::ManifestError::YamlParse { .. }
+        ));
+        assert!(bundle_yaml.to_string().contains("invalid.bundle.yaml"));
+
+        let agent_io = loader
+            .load_agent_spec(&missing_agent, &bundle_entry("demo", true))
+            .expect_err("missing agent should fail");
+        assert!(matches!(agent_io, crate::ManifestError::Io { .. }));
+        assert!(agent_io.to_string().contains("missing.agent.yaml"));
+
+        let invalid_agent = temp.path().join("invalid.agent.yaml");
+        fs::write(&invalid_agent, "not: [valid").expect("write invalid agent");
+        let agent_yaml = loader
+            .load_agent_spec(&invalid_agent, &bundle_entry("demo", true))
+            .expect_err("invalid agent yaml should fail");
+        assert!(matches!(agent_yaml, crate::ManifestError::YamlParse { .. }));
+        assert!(agent_yaml.to_string().contains("invalid.agent.yaml"));
+    }
+
+    #[test]
+    fn load_agent_spec_merges_required_tools_and_applies_default_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_path = temp.path().join("agent.yaml");
+        fs::write(
+            &agent_path,
+            r#"
+apiVersion: odyssey.ai/v1
+kind: Agent
+metadata:
+  name: helper
+  version: 0.2.0
+spec:
+  kind: prompt
+  abiVersion: v1
+  prompt: assist the user
+  tools:
+    require: ["Read"]
+  requires:
+    tools: ["Edit", "Read"]
+"#,
+        )
+        .expect("agent");
+
+        let agent = BundleLoader::new(temp.path())
+            .load_agent_spec(&agent_path, &bundle_entry("helper", true))
+            .expect("agent spec");
+
+        assert_eq!(agent.model.provider, "openai");
+        assert_eq!(agent.model.name, "gpt-4.1-mini");
+        assert_eq!(
+            agent.tools.require,
+            vec!["Edit".to_string(), "Read".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_project_rejects_agent_constraints_and_missing_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("README.md"), "# Demo\n").expect("readme");
+        let loader = BundleLoader::new(temp.path());
+
+        let no_agents = BundleDescriptor {
+            manifest: base_manifest(Vec::new()),
+            agents: Vec::new(),
+        };
+        assert_eq!(
+            loader
+                .validate_project(&no_agents)
+                .expect_err("missing agents rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: bundle must declare at least one agent",
+                temp.path().display()
+            )
+        );
+
+        let no_default = BundleDescriptor {
+            manifest: base_manifest(vec![
+                bundle_entry("alpha", false),
+                bundle_entry("beta", false),
+            ]),
+            agents: vec![prompt_agent("alpha"), prompt_agent("beta")],
+        };
+        assert_eq!(
+            loader
+                .validate_project(&no_default)
+                .expect_err("multi-agent bundle without default rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: multi-agent bundles must declare exactly one default agent",
+                temp.path().display()
+            )
+        );
+
+        let duplicate_default = BundleDescriptor {
+            manifest: base_manifest(vec![
+                bundle_entry("alpha", true),
+                bundle_entry("beta", true),
+            ]),
+            agents: vec![prompt_agent("alpha"), prompt_agent("beta")],
+        };
+        assert_eq!(
+            loader
+                .validate_project(&duplicate_default)
+                .expect_err("multiple defaults rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: bundle must not declare more than one default agent",
+                temp.path().display()
+            )
+        );
+
+        let mut manifest = base_manifest(vec![bundle_entry("alpha", true)]);
+        manifest.skills.push(BundleSkill {
+            name: "missing".to_string(),
+            path: "skills/missing".to_string(),
+        });
+        let missing_skill = BundleDescriptor {
+            manifest,
+            agents: vec![prompt_agent("alpha")],
+        };
+        let error = loader
+            .validate_project(&missing_skill)
+            .expect_err("missing skill should fail");
+        assert!(error.to_string().contains("skill path does not exist"));
+    }
+
+    #[test]
+    fn validate_agent_and_sandbox_helpers_reject_invalid_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("README.md"), "# Demo\n").expect("readme");
+        let loader = BundleLoader::new(temp.path());
+        let bundle = base_manifest(vec![bundle_entry("demo", true)]);
+        let mut agent = prompt_agent("demo");
+
+        agent.abi_version.clear();
+        assert_eq!(
+            loader
+                .validate_agent(&bundle, &agent)
+                .expect_err("blank abi rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: bundle and agent abi versions are required",
+                temp.path().display()
+            )
+        );
+
+        let mut agent = prompt_agent("demo");
+        agent.abi_version = "v2".to_string();
+        assert_eq!(
+            loader
+                .validate_agent(&bundle, &agent)
+                .expect_err("abi mismatch rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: bundle abi version must match each agent abi version",
+                temp.path().display()
+            )
+        );
+
+        let mut agent = prompt_agent("demo");
+        agent.prompt.clear();
+        assert_eq!(
+            loader
+                .validate_agent(&bundle, &agent)
+                .expect_err("empty prompt rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: prompt agents require a non-empty prompt",
+                temp.path().display()
+            )
+        );
+
+        let mut agent = prompt_agent("demo");
+        agent.model.provider.clear();
+        assert_eq!(
+            loader
+                .validate_agent(&bundle, &agent)
+                .expect_err("missing model rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent model provider and name are required",
+                temp.path().display()
+            )
+        );
+
+        let mut agent = prompt_agent("demo");
+        agent.tools.allow = vec![" ".to_string()];
+        assert_eq!(
+            loader
+                .validate_agent(&bundle, &agent)
+                .expect_err("blank tool entry rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent.tools.allow entries cannot be empty",
+                temp.path().display()
+            )
+        );
+
+        let mut sandbox = BundleSandbox::default();
+        sandbox.permissions.filesystem.exec = vec!["missing.sh".to_string()];
+        assert!(
+            validate_sandbox(temp.path(), &sandbox)
+                .expect_err("missing exec path rejected")
+                .to_string()
+                .contains("sandbox exec path does not exist")
+        );
+
+        sandbox.permissions.filesystem.exec.clear();
+        sandbox.permissions.filesystem.mounts.write = vec!["relative".to_string()];
+        assert_eq!(
+            validate_sandbox(temp.path(), &sandbox)
+                .expect_err("relative write mount rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: write mount must be an absolute host path or `.`",
+                temp.path().display()
+            )
+        );
+
+        sandbox.permissions.filesystem.mounts.write.clear();
+        sandbox.permissions.network = vec!["wttr.in".to_string()];
+        assert_eq!(
+            validate_sandbox(temp.path(), &sandbox)
+                .expect_err("partial network allowlist rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: sandbox.permissions.network only supports [] or [\"*\"]",
+                temp.path().display()
+            )
+        );
+
+        sandbox.permissions.network.clear();
+        sandbox.env.insert("".to_string(), "SOURCE".to_string());
+        assert_eq!(
+            validate_sandbox(temp.path(), &sandbox)
+                .expect_err("blank sandbox env target rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: sandbox.env target cannot be empty",
+                temp.path().display()
+            )
+        );
+
+        sandbox.env.clear();
+        sandbox
+            .env
+            .insert("TARGET".to_string(), "BAD=VALUE".to_string());
+        assert_eq!(
+            validate_sandbox(temp.path(), &sandbox)
+                .expect_err("invalid sandbox env source rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: sandbox.env source must not contain `=`",
+                temp.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn relative_path_and_wasm_helpers_reject_invalid_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let existing_dir = temp.path().join("dir");
+        let existing_file = temp.path().join("file.txt");
+        fs::create_dir_all(&existing_dir).expect("dir");
+        fs::write(&existing_file, "demo").expect("file");
+
+        assert_eq!(
+            ensure_relative_entry(temp.path(), "", "agent entrypoint")
+                .expect_err("empty entry rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent entrypoint cannot be empty",
+                temp.path().display()
+            )
+        );
+        let absolute_entry = existing_file.to_string_lossy().to_string();
+        assert_eq!(
+            ensure_relative_entry(temp.path(), &absolute_entry, "agent entrypoint")
+                .expect_err("absolute entry rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent entrypoint must be relative to the project root",
+                temp.path().display()
+            )
+        );
+        assert_eq!(
+            ensure_relative_entry(temp.path(), "../demo", "agent entrypoint")
+                .expect_err("escaping entry rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent entrypoint must stay inside the project root",
+                temp.path().display()
+            )
+        );
+        assert!(
+            ensure_relative_entry(temp.path(), "missing.txt", "agent entrypoint")
+                .expect_err("missing entry rejected")
+                .to_string()
+                .contains("agent entrypoint does not exist")
+        );
+        assert_eq!(
+            ensure_relative_file(temp.path(), "dir", "agent entrypoint")
+                .expect_err("directory rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: agent entrypoint must be a file",
+                temp.path().display()
+            )
+        );
+        assert_eq!(
+            ensure_absolute_mount(temp.path(), "relative", "read mount")
+                .expect_err("relative mount rejected")
+                .to_string(),
+            format!(
+                "invalid manifest at {}: read mount must be an absolute host path or `.`",
+                temp.path().display()
+            )
+        );
+        ensure_absolute_mount(temp.path(), "./.", "read mount").expect("current directory mount");
+
+        assert!(
+            validate_optional_schema(temp.path(), Some("missing.json"), "input schema")
+                .expect_err("missing schema rejected")
+                .to_string()
+                .contains("input schema does not exist")
+        );
+        assert!(
+            canonicalize_root(temp.path().join("missing-root").as_path())
+                .expect_err("missing root rejected")
+                .to_string()
+                .contains("missing-root")
+        );
+        assert!(
+            validate_wasm_component(temp.path().join("missing.wasm").as_path())
+                .expect_err("missing wasm rejected")
+                .to_string()
+                .contains("missing.wasm")
         );
     }
 }

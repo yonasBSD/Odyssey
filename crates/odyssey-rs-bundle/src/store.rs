@@ -1085,14 +1085,20 @@ fn _artifact_to_install(artifact: BundleArtifact) -> BundleInstall {
 #[cfg(test)]
 mod tests {
     use super::{
-        BundleInstallSummary, BundleStore, collect_id_installs, collect_namespace_installs,
-        commit_staged_install, load_bundle_install, read_dir_entries, select_newer_bundle_install,
+        _artifact_to_install, BundleInstallSummary, BundleStore, ParsedVersion, VersionIdentifier,
+        close_temp_dir, collect_id_installs, collect_namespace_installs, commit_staged_install,
+        compare_bundle_versions, compare_prerelease, create_temp_dir, has_bundle_metadata,
+        load_bundle_install, materialize_archive_ranges, metadata_matches_config, metadata_root,
+        parse_semver_like, read_dir_entries, read_metadata, remove_dir_if_empty,
+        remove_dir_if_exists, safe_relative_join, select_newer_bundle_install,
+        validate_remote_layers, validate_store_component,
     };
-    use crate::BundleError;
     use crate::constants::ARCHIVE_MAGIC;
-    use crate::layout::{blob_path, read_blob, read_manifest};
+    use crate::layout::{blob_path, read_blob, read_config, read_manifest};
     use crate::test_support::write_bundle_project;
+    use crate::{BundleArtifact, BundleError};
     use pretty_assertions::assert_eq;
+    use std::cmp::Ordering;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1752,5 +1758,334 @@ mod tests {
             install.metadata.digest
         );
         assert!(!store.install_staging_parent().exists());
+    }
+
+    #[test]
+    fn from_default_location_resolves_under_the_user_home_directory() {
+        let store = BundleStore::from_default_location().expect("default store");
+
+        assert!(store.root.ends_with(".odyssey/bundles"));
+    }
+
+    #[test]
+    fn safe_relative_join_normalizes_current_dir_and_rejects_invalid_paths() {
+        let temp = tempdir().expect("tempdir");
+
+        assert_eq!(
+            safe_relative_join(temp.path(), "./nested/file.txt", "bundle file")
+                .expect("normalize path"),
+            temp.path().join("nested").join("file.txt")
+        );
+        assert_eq!(
+            safe_relative_join(temp.path(), "", "bundle file")
+                .expect_err("empty path rejected")
+                .to_string(),
+            "invalid bundle: bundle file cannot be empty"
+        );
+        assert!(safe_relative_join(temp.path(), "/absolute", "bundle file").is_err());
+        assert!(safe_relative_join(temp.path(), "../escape", "bundle file").is_err());
+    }
+
+    #[test]
+    fn metadata_helpers_detect_root_and_nested_bundle_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let bundle_root = temp.path().join("bundle");
+        let nested_root = bundle_root.join(".odyssey");
+        fs::create_dir_all(&nested_root).expect("create nested root");
+        fs::write(bundle_root.join("bundle.json"), "{}").expect("write root bundle json");
+        fs::write(nested_root.join("bundle.json"), "{}").expect("write nested bundle json");
+
+        assert_eq!(metadata_root(&bundle_root), Some(bundle_root.clone()));
+        assert!(has_bundle_metadata(&bundle_root));
+
+        fs::remove_file(bundle_root.join("bundle.json")).expect("remove root bundle json");
+        assert_eq!(metadata_root(&bundle_root), Some(nested_root.clone()));
+        assert!(has_bundle_metadata(&bundle_root));
+    }
+
+    #[test]
+    fn metadata_matches_config_checks_the_core_identity_fields() {
+        let temp = tempdir().expect("tempdir");
+        let store = BundleStore::new(temp.path().join("store"));
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(
+            &project_root,
+            "demo",
+            "0.1.0",
+            "data/notes.txt",
+            "hello world\n",
+        );
+        let metadata = store
+            .build_and_install(&project_root)
+            .expect("build and install")
+            .metadata;
+
+        assert!(metadata_matches_config(&metadata, &metadata));
+
+        let mut different = metadata.clone();
+        different.readme = "# changed\n".to_string();
+        assert!(!metadata_matches_config(&metadata, &different));
+    }
+
+    #[test]
+    fn validate_remote_layers_accepts_matching_layers_and_rejects_inconsistent_hub_data() {
+        let temp = tempdir().expect("tempdir");
+        let store = BundleStore::new(temp.path().join("store"));
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(
+            &project_root,
+            "demo",
+            "0.1.0",
+            "data/notes.txt",
+            "hello world\n",
+        );
+        let install = store
+            .build_and_install(&project_root)
+            .expect("build and install");
+        let layout_root = install.path.join(".odyssey");
+        let (_, manifest, _) = read_manifest(&layout_root).expect("read manifest");
+        let valid_layers = manifest
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.digest.clone(),
+                    read_blob(&layout_root, &layer.digest).expect("read layer"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            validate_remote_layers(&manifest, valid_layers.clone())
+                .expect("valid layers")
+                .len(),
+            manifest.layers.len()
+        );
+
+        let duplicate = vec![
+            valid_layers[0].clone(),
+            (valid_layers[0].0.clone(), valid_layers[0].1.clone()),
+        ];
+        assert!(
+            validate_remote_layers(&manifest, duplicate)
+                .expect_err("duplicate digest")
+                .to_string()
+                .contains("duplicate layer digest")
+        );
+
+        let missing = valid_layers[..valid_layers.len().saturating_sub(1)].to_vec();
+        assert!(
+            validate_remote_layers(&manifest, missing)
+                .expect_err("missing layer")
+                .to_string()
+                .contains("missing layer")
+        );
+    }
+
+    #[test]
+    fn install_remote_layout_round_trips_bundle_metadata_and_payloads() {
+        let temp = tempdir().expect("tempdir");
+        let source_store = BundleStore::new(temp.path().join("source-store"));
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(
+            &project_root,
+            "demo",
+            "0.1.0",
+            "data/notes.txt",
+            "hello world\n",
+        );
+        let install = source_store
+            .build_and_install(&project_root)
+            .expect("build and install");
+        let layout_root = install.path.join(".odyssey");
+        let index_bytes = fs::read(layout_root.join("index.json")).expect("read index");
+        let (_, manifest, manifest_digest) = read_manifest(&layout_root).expect("read manifest");
+        let manifest_bytes = read_blob(&layout_root, &manifest_digest).expect("read manifest blob");
+        let config_bytes =
+            read_blob(&layout_root, &manifest.config.digest).expect("read config blob");
+        let layers = manifest
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.digest.clone(),
+                    read_blob(&layout_root, &layer.digest).expect("read layer blob"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let remote_store = BundleStore::new(temp.path().join("remote-store"));
+        let pulled = remote_store
+            .install_remote_layout(
+                install.metadata.clone(),
+                index_bytes,
+                manifest_bytes,
+                config_bytes,
+                layers,
+            )
+            .expect("install remote layout");
+        let remote_layout = pulled.path.join(".odyssey");
+        let remote_config = read_config(
+            &remote_layout,
+            &read_manifest(&remote_layout)
+                .expect("read remote manifest")
+                .1,
+        )
+        .expect("read remote config");
+
+        assert_eq!(pulled.metadata.digest, install.metadata.digest);
+        assert_eq!(remote_config.id, "demo");
+        assert_eq!(
+            fs::read_to_string(pulled.path.join("resources").join("data").join("notes.txt"))
+                .expect("read restored resource"),
+            "hello world\n"
+        );
+        assert!(remote_store.root.join("blobs").exists());
+    }
+
+    #[test]
+    fn remove_dir_helpers_handle_missing_non_empty_and_empty_directories() {
+        let temp = tempdir().expect("tempdir");
+        let empty = temp.path().join("empty");
+        let non_empty = temp.path().join("non-empty");
+        fs::create_dir_all(&empty).expect("create empty");
+        fs::create_dir_all(&non_empty).expect("create non-empty");
+        fs::write(non_empty.join("file.txt"), "data").expect("write file");
+
+        remove_dir_if_exists(&temp.path().join("missing")).expect("missing dir ignored");
+        remove_dir_if_empty(&non_empty).expect("non-empty dir preserved");
+        assert!(non_empty.exists());
+
+        remove_dir_if_empty(&empty).expect("empty dir removed");
+        assert!(!empty.exists());
+
+        remove_dir_if_exists(&non_empty).expect("remove non-empty dir");
+        assert!(!non_empty.exists());
+    }
+
+    #[test]
+    fn create_temp_dir_and_close_temp_dir_manage_staging_paths() {
+        let temp = tempdir().expect("tempdir");
+        let parent = temp.path().join("staging");
+
+        let temp_dir = create_temp_dir(&parent, "bundle-").expect("create temp dir");
+        assert!(temp_dir.path().starts_with(&parent));
+        let temp_path = temp_dir.path().to_path_buf();
+        close_temp_dir(temp_dir).expect("close temp dir");
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn materialize_archive_ranges_writes_each_target_file() {
+        let temp = tempdir().expect("tempdir");
+        let archive = b"hello world".to_vec();
+        let entries = vec![
+            ("nested/a.txt".to_string(), 0..5),
+            ("nested/b.txt".to_string(), 6..11),
+        ];
+
+        materialize_archive_ranges(temp.path(), &archive, &entries).expect("materialize ranges");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("nested").join("a.txt")).expect("read a"),
+            "hello"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("nested").join("b.txt")).expect("read b"),
+            "world"
+        );
+    }
+
+    #[test]
+    fn version_helpers_cover_semver_and_fallback_ordering() {
+        assert_eq!(
+            compare_bundle_versions("1.0.0", "1.0.0-rc.1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_bundle_versions("not-semver", "1.0.0"),
+            Ordering::Less
+        );
+        assert_eq!(compare_bundle_versions("beta", "alpha"), Ordering::Greater);
+
+        assert_eq!(
+            compare_prerelease(
+                &[VersionIdentifier::Numeric(1)],
+                &[VersionIdentifier::AlphaNumeric("a".to_string())]
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_prerelease(
+                &[VersionIdentifier::AlphaNumeric("beta".to_string())],
+                &[VersionIdentifier::AlphaNumeric("beta".to_string())]
+            ),
+            Ordering::Equal
+        );
+
+        assert_eq!(
+            parse_semver_like("1.2.3-beta.4+build"),
+            Some(ParsedVersion {
+                core: [1, 2, 3],
+                prerelease: vec![
+                    VersionIdentifier::AlphaNumeric("beta".to_string()),
+                    VersionIdentifier::Numeric(4),
+                ],
+            })
+        );
+        assert_eq!(parse_semver_like("1.2"), None);
+        assert_eq!(parse_semver_like("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn validate_store_component_and_read_metadata_report_invalid_inputs() {
+        for value in ["", "/absolute", "../escape"] {
+            let error = validate_store_component(value, "bundle id")
+                .expect_err("invalid component rejected");
+            assert!(error.to_string().contains("bundle id"));
+        }
+        validate_store_component("nested/path", "bundle id")
+            .expect("normal relative path components are allowed");
+
+        let temp = tempdir().expect("tempdir");
+        let bundle_root = temp.path().join("bundle");
+        let metadata_root = bundle_root.join(".odyssey");
+        fs::create_dir_all(&metadata_root).expect("create metadata root");
+        fs::write(metadata_root.join("bundle.json"), "{ invalid json").expect("write invalid json");
+
+        let error = read_metadata(&bundle_root).expect_err("invalid metadata rejected");
+        assert!(matches!(error, BundleError::Invalid(_)));
+    }
+
+    #[test]
+    fn artifact_to_install_preserves_the_artifact_path_and_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let store = BundleStore::new(temp.path().join("store"));
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(
+            &project_root,
+            "demo",
+            "0.1.0",
+            "data/notes.txt",
+            "hello world\n",
+        );
+        let metadata = store
+            .build_and_install(&project_root)
+            .expect("build and install")
+            .metadata;
+        let artifact_path = temp.path().join("demo.artifact");
+        let artifact = BundleArtifact {
+            path: artifact_path.clone(),
+            metadata: metadata.clone(),
+        };
+
+        let install = _artifact_to_install(artifact);
+
+        assert_eq!(install.path, artifact_path);
+        assert_eq!(install.metadata.id, metadata.id);
     }
 }

@@ -137,3 +137,45 @@ impl Widget for Logo {
         Paragraph::new(lines).render(render_area, buf);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LOGO_ROWS, LOGO_ROWS_COMPACT, LOGO_WIDTH, Logo, logo_lines, logo_lines_compact};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Style;
+    fn flatten(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn logo_helpers_return_full_and_compact_rows() {
+        assert_eq!(flatten(&logo_lines(Style::default())), LOGO_ROWS);
+        assert_eq!(
+            flatten(&logo_lines_compact(Style::default())),
+            LOGO_ROWS_COMPACT
+        );
+    }
+
+    #[test]
+    fn logo_widget_centers_the_full_logo_in_the_available_area() {
+        let backend = TestBackend::new(LOGO_WIDTH + 6, 7);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        terminal
+            .draw(|frame| frame.render_widget(Logo::new(Style::default()), frame.area()))
+            .expect("draw logo");
+
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains(&format!("   {}", LOGO_ROWS[0])));
+        assert!(rendered.contains(&format!("   {}", LOGO_ROWS[1])));
+        assert!(rendered.contains(&format!("   {}", LOGO_ROWS[2])));
+    }
+}

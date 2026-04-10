@@ -919,20 +919,64 @@ pub fn bind_if_exists(args: &mut Vec<String>, flag: &str, source: &Path, target:
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessPolicy, bind_if_exists, build_mounts_from_policy, build_prepared_sandbox,
-        command_display, effective_output_limit, effective_wall_clock, merge_command_env,
-        normalize_existing_roots, normalize_lexical, reject_glob, resolve_command_path,
+        AccessPolicy, SandboxProvider, append_with_limit, bind_if_exists, build_env,
+        build_mounts_from_policy, build_prepared_sandbox, command_display, effective_output_limit,
+        effective_wall_clock, insert_mount, merge_command_env, normalize_existing_roots,
+        normalize_lexical, reject_glob, resolve_command_path, resolve_mount_target,
         resolve_user_path, resolve_working_dir, run_host_process, validate_host_execution_context,
     };
     use crate::{
-        AccessDecision, AccessMode, CommandSpec, SandboxContext, SandboxFilesystemPolicy,
-        SandboxLimits, SandboxMountBinding, SandboxNetworkMode, SandboxNetworkPolicy,
-        SandboxPolicy,
+        AccessDecision, AccessMode, CommandResult, CommandSpec, SandboxContext, SandboxEnvPolicy,
+        SandboxFilesystemPolicy, SandboxHandle, SandboxLimits, SandboxMountBinding,
+        SandboxNetworkMode, SandboxNetworkPolicy, SandboxPolicy,
     };
+    use async_trait::async_trait;
     use odyssey_rs_protocol::SandboxMode;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+    use uuid::Uuid;
+
+    struct NoopProvider;
+
+    #[async_trait]
+    impl SandboxProvider for NoopProvider {
+        async fn prepare(
+            &self,
+            _ctx: &SandboxContext,
+        ) -> Result<SandboxHandle, crate::SandboxError> {
+            Ok(SandboxHandle { id: Uuid::nil() })
+        }
+
+        async fn run_command(
+            &self,
+            _handle: &SandboxHandle,
+            _spec: CommandSpec,
+        ) -> Result<CommandResult, crate::SandboxError> {
+            Ok(CommandResult::default())
+        }
+
+        async fn run_command_streaming(
+            &self,
+            _handle: &SandboxHandle,
+            _spec: CommandSpec,
+            _sink: &mut dyn super::CommandOutputSink,
+        ) -> Result<CommandResult, crate::SandboxError> {
+            Ok(CommandResult::default())
+        }
+
+        fn check_access(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &Path,
+            _mode: AccessMode,
+        ) -> AccessDecision {
+            AccessDecision::Allow
+        }
+
+        fn shutdown(&self, _handle: SandboxHandle) {}
+    }
 
     #[test]
     fn read_only_mode_denies_workspace_write_and_requires_explicit_exec_roots() {
@@ -1033,6 +1077,18 @@ mod tests {
     }
 
     #[test]
+    fn default_trait_helpers_return_unsupported_spawn_and_empty_dependency_report() {
+        let provider = NoopProvider;
+        let error = provider
+            .spawn_command(&SandboxHandle { id: Uuid::nil() }, CommandSpec::new("sh"))
+            .expect_err("spawn should be unsupported by default");
+
+        assert!(error.to_string().contains("long-lived protocol transports"));
+        assert!(provider.dependency_report().errors.is_empty());
+        assert!(provider.dependency_report().warnings.is_empty());
+    }
+
+    #[test]
     fn bind_if_exists_adds_flag_when_present() {
         let temp = tempdir().expect("tempdir");
         let mut args = Vec::new();
@@ -1071,6 +1127,34 @@ mod tests {
                 .map(tempfile::TempDir::path),
             Some(tmpdir.as_path())
         );
+    }
+
+    #[test]
+    fn build_env_injects_default_path_and_explicit_tmpdir_avoids_private_directory() {
+        let temp = tempdir().expect("tempdir");
+        let explicit_tmp = temp.path().join("explicit-tmp");
+        std::fs::create_dir_all(&explicit_tmp).expect("explicit tmp");
+        let policy = SandboxPolicy {
+            env: SandboxEnvPolicy {
+                inherit: vec!["ODYSSEY_TEST_MISSING".to_string()],
+                set: BTreeMap::from([("TMPDIR".to_string(), explicit_tmp.display().to_string())]),
+            },
+            ..SandboxPolicy::default()
+        };
+
+        let (env, allowed) = build_env(&policy, temp.path(), None);
+        assert_eq!(env.get("TMPDIR"), Some(&explicit_tmp.display().to_string()));
+        assert_eq!(env.get("PATH"), Some(&super::DEFAULT_PATH.to_string()));
+        assert!(allowed.contains("PATH"));
+        assert!(!allowed.contains("ODYSSEY_TEST_MISSING"));
+
+        let prepared = build_prepared_sandbox(&SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy,
+        })
+        .expect("prepared");
+        assert!(prepared._private_tmp_dir.is_none());
     }
 
     #[test]
@@ -1120,6 +1204,36 @@ mod tests {
             error.to_string(),
             "access denied: environment variable is not allowed by sandbox policy: UNSAFE"
         );
+    }
+
+    #[test]
+    fn merge_command_env_accepts_allowed_overrides_and_append_with_limit_short_circuits() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::WorkspaceWrite,
+            policy: SandboxPolicy::default(),
+        };
+        let prepared = build_prepared_sandbox(&ctx).expect("prepared");
+        let overrides = BTreeMap::from([("PATH".to_string(), "/custom/bin".to_string())]);
+
+        let merged = merge_command_env(&prepared, &overrides).expect("merge env");
+        assert_eq!(merged.get("PATH"), Some(&"/custom/bin".to_string()));
+
+        let mut truncated = true;
+        let mut buffer = String::default();
+        assert_eq!(
+            append_with_limit(b"ignored", &mut buffer, 8, &mut truncated),
+            None
+        );
+
+        let mut truncated = false;
+        let mut buffer = "full".to_string();
+        assert_eq!(
+            append_with_limit(b"ignored", &mut buffer, 4, &mut truncated),
+            None
+        );
+        assert!(truncated);
     }
 
     #[test]
@@ -1228,6 +1342,86 @@ mod tests {
             error
                 .to_string()
                 .contains("working directory is not a directory")
+        );
+    }
+
+    #[test]
+    fn access_and_path_helpers_reject_unresolvable_or_disallowed_locations() {
+        let temp = tempdir().expect("tempdir");
+        let policy = SandboxPolicy::default();
+        let access =
+            AccessPolicy::new(SandboxMode::WorkspaceWrite, &policy, temp.path()).expect("access");
+        assert_eq!(
+            access.check(Path::new(""), AccessMode::Read),
+            AccessDecision::Deny("access denied: empty path is not allowed".to_string())
+        );
+
+        let prepared = build_prepared_sandbox(&SandboxContext {
+            workspace_root: temp.path().to_path_buf(),
+            mode: SandboxMode::ReadOnly,
+            policy,
+        })
+        .expect("prepared");
+        let mut spec = CommandSpec::new("sh");
+        spec.cwd = Some(PathBuf::from("/bin"));
+        assert!(
+            resolve_working_dir(&spec, &prepared)
+                .expect_err("unmounted cwd rejected")
+                .to_string()
+                .contains("sandbox policy blocks")
+        );
+
+        let missing = temp.path().join("missing-tool");
+        assert!(
+            resolve_command_path(&missing, temp.path(), &prepared)
+                .expect_err("missing executable rejected")
+                .to_string()
+                .contains("executable does not exist")
+        );
+        assert!(
+            resolve_command_path(Path::new("sh"), temp.path(), &prepared)
+                .expect_err("disallowed executable rejected")
+                .to_string()
+                .contains("executable is not permitted")
+        );
+    }
+
+    #[test]
+    fn mount_helpers_cover_relative_targets_and_conflicting_sources() {
+        let temp = tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_mount_target(temp.path(), "nested/tool").expect("relative mount"),
+            temp.path().join("nested").join("tool")
+        );
+
+        let target = temp.path().join("target");
+        let source_a = temp.path().join("source-a");
+        let source_b = temp.path().join("source-b");
+        std::fs::create_dir_all(&source_a).expect("source a");
+        std::fs::create_dir_all(&source_b).expect("source b");
+        let mut mounts = BTreeMap::new();
+
+        insert_mount(&mut mounts, source_a.clone(), target.clone(), false).expect("insert mount");
+        insert_mount(&mut mounts, source_a, target.clone(), true).expect("upgrade mount");
+        assert!(mounts.get(&target).expect("mount").writable);
+
+        let error = insert_mount(&mut mounts, source_b, target.clone(), false)
+            .expect_err("conflicting mount rejected");
+        assert!(error.to_string().contains("resolves to multiple sources"));
+
+        let policy = SandboxPolicy {
+            filesystem: SandboxFilesystemPolicy {
+                exec_allow_all: true,
+                ..SandboxFilesystemPolicy::default()
+            },
+            ..SandboxPolicy::default()
+        };
+        let mounts = build_mounts_from_policy(temp.path(), SandboxMode::ReadOnly, &policy)
+            .expect("build mounts");
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == temp.path() && !mount.writable)
         );
     }
 

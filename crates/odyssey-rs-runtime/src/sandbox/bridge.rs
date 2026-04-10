@@ -249,9 +249,12 @@ fn resolve_host_mount_path(value: &str, current_dir: &Path) -> String {
 }
 
 fn is_current_directory_mount(value: &str) -> bool {
-    let mut components = Path::new(value).components();
-    components.next().is_some()
-        && components.all(|component| component == std::path::Component::CurDir)
+    let mut saw_component = false;
+    let all_current = Path::new(value).components().all(|component| {
+        saw_component = true;
+        component == std::path::Component::CurDir
+    });
+    saw_component && all_current
 }
 
 pub fn build_mode(
@@ -819,9 +822,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use super::{
         MountTargetPreparation, build_mode, build_network_policy, build_operator_command_policy,
-        build_permission_rules, build_policy, build_policy_with_resolvers, prepare_cell,
-        prepare_host_mount_targets, prepare_operator_command_cell, stage_bundle,
-        stage_bundle_if_needed, target_has_entries, validate_provider_support, verify_system_tools,
+        build_permission_rules, build_policy, build_policy_with_resolvers, mount_target_path,
+        prepare_cell, prepare_host_mount_targets, prepare_operator_command_cell,
+        resolve_system_tool_aliases, sanitize_mount_segment, stage_bundle, stage_bundle_if_needed,
+        target_has_entries, validate_provider_support, validate_staged_bundle_exec_roots,
+        verify_system_tools,
     };
     use odyssey_rs_manifest::{
         AgentSpec, AgentToolPolicy, BundleExecutor, BundleManifest, BundleMemory, BundleSandbox,
@@ -829,7 +834,10 @@ mod tests {
         BundleSandboxPermissions, BundleSignatures, BundleSystemToolsMode, ManifestVersion,
         ProviderKind,
     };
-    use odyssey_rs_protocol::SandboxMode;
+    use odyssey_rs_protocol::{
+        SandboxMode, SessionSandboxFilesystem, SessionSandboxMounts, SessionSandboxOverlay,
+        SessionSandboxPermissions,
+    };
     use odyssey_rs_sandbox::{
         LocalSandboxProvider, SandboxMountBinding, SandboxNetworkMode, SandboxPolicy,
         SandboxRuntime,
@@ -1051,6 +1059,53 @@ mod tests {
     }
 
     #[test]
+    fn prepare_host_mount_targets_replaces_existing_directory_when_source_is_a_file() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello").expect("source file");
+        let target = temp
+            .path()
+            .join("bundle")
+            .join("mount")
+            .join("read")
+            .join("source.txt");
+        std::fs::create_dir_all(&target).expect("conflicting target dir");
+
+        prepare_host_mount_targets(
+            &[SandboxMountBinding {
+                source: source.display().to_string(),
+                target: target.display().to_string(),
+                writable: false,
+            }],
+            MountTargetPreparation::Placeholder,
+        )
+        .expect("prepare mount target");
+
+        let metadata = std::fs::symlink_metadata(&target).expect("target metadata");
+        assert!(metadata.is_file());
+        assert_eq!(std::fs::read_to_string(&target).expect("target file"), "");
+    }
+
+    #[test]
+    fn mount_target_path_and_sanitize_mount_segment_cover_edge_cases() {
+        assert_eq!(sanitize_mount_segment(""), "mount");
+        assert_eq!(sanitize_mount_segment("host path"), "host-path");
+        assert_eq!(
+            mount_target_path(Path::new("/bundle-root"), true, "./.", Path::new("ignored")),
+            Path::new("/bundle-root/mount/write/current")
+        );
+        assert_eq!(
+            mount_target_path(
+                Path::new("/bundle-root"),
+                false,
+                "/irrelevant",
+                Path::new("relative/./../file name")
+            ),
+            Path::new("/bundle-root/mount/read/abs/relative/parent/file name")
+        );
+    }
+
+    #[test]
     fn build_mode_prefers_runtime_override() {
         let manifest = BundleManifest {
             sandbox: BundleSandbox {
@@ -1066,8 +1121,121 @@ mod tests {
 
         assert_eq!(build_mode(&manifest, None, None), SandboxMode::ReadOnly);
         assert_eq!(
+            build_mode(
+                &manifest,
+                Some(&SessionSandboxOverlay {
+                    mode: Some(SandboxMode::WorkspaceWrite),
+                    ..SessionSandboxOverlay::default()
+                }),
+                None,
+            ),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
             build_mode(&manifest, None, Some(SandboxMode::DangerFullAccess)),
             SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn build_policy_with_overlay_merges_overlay_mounts_exec_roots_and_env() {
+        let manifest = BundleManifest {
+            sandbox: BundleSandbox {
+                mode: SandboxMode::ReadOnly,
+                permissions: BundleSandboxPermissions {
+                    filesystem: BundleSandboxFilesystem {
+                        exec: vec!["bin/base".to_string()],
+                        mounts: BundleSandboxMounts {
+                            read: vec!["/host/base-read".to_string()],
+                            write: Vec::new(),
+                        },
+                    },
+                    network: Vec::new(),
+                },
+                env: BTreeMap::from([("BASE_TOKEN".to_string(), "BASE_ENV".to_string())]),
+                system_tools_mode: BundleSystemToolsMode::Explicit,
+                system_tools: Vec::new(),
+                resources: BundleSandboxLimits::default(),
+            },
+            ..test_manifest()
+        };
+        let overlay = SessionSandboxOverlay {
+            mode: Some(SandboxMode::WorkspaceWrite),
+            permissions: SessionSandboxPermissions {
+                filesystem: SessionSandboxFilesystem {
+                    exec: vec!["overlay/bin".to_string()],
+                    mounts: SessionSandboxMounts {
+                        read: vec!["/host/overlay-read".to_string()],
+                        write: vec!["/host/overlay-write".to_string()],
+                    },
+                },
+            },
+            env: BTreeMap::from([("OVERLAY_TOKEN".to_string(), "OVERLAY_ENV".to_string())]),
+            system_tools: vec!["sh".to_string()],
+        };
+
+        let policy = build_policy_with_resolvers(
+            Path::new("/bundle-root"),
+            &manifest,
+            Some(&overlay),
+            &[],
+            false,
+            |name| match name {
+                "BASE_ENV" => Some("base-secret".to_string()),
+                "OVERLAY_ENV" => Some("overlay-secret".to_string()),
+                _ => None,
+            },
+            Path::new("/runtime-cwd"),
+        )
+        .expect("build policy");
+        let sh = which::which("sh")
+            .expect("resolve sh")
+            .canonicalize()
+            .expect("canonicalize sh");
+
+        assert!(
+            policy
+                .filesystem
+                .read_roots
+                .contains(&"/bundle-root/mount/read/abs/host/base-read".to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .read_roots
+                .contains(&"/bundle-root/mount/read/abs/host/overlay-read".to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .write_roots
+                .contains(&"/bundle-root/mount/write/abs/host/overlay-write".to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .exec_roots
+                .contains(&"/bundle-root/bin/base".to_string())
+        );
+        assert!(
+            policy
+                .filesystem
+                .exec_roots
+                .contains(&"overlay/bin".to_string())
+        );
+        assert!(policy.filesystem.exec_roots.iter().any(|path| {
+            Path::new(path)
+                .canonicalize()
+                .map(|resolved| resolved == sh)
+                .unwrap_or(false)
+        }));
+        assert_eq!(
+            policy.env.set.get("BASE_TOKEN"),
+            Some(&"base-secret".to_string())
+        );
+        assert_eq!(
+            policy.env.set.get("OVERLAY_TOKEN"),
+            Some(&"overlay-secret".to_string())
         );
     }
 
@@ -1326,6 +1494,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_system_tool_aliases_and_network_policy_cover_remaining_branches() {
+        let temp = tempdir().expect("tempdir");
+        let tool_path = temp.path().join("tool.sh");
+        std::fs::write(&tool_path, "#!/bin/sh\n").expect("tool path");
+
+        assert_eq!(
+            resolve_system_tool_aliases(tool_path.to_str().expect("utf8 path"))
+                .expect("absolute tool path"),
+            vec![tool_path.display().to_string()]
+        );
+        assert!(
+            resolve_system_tool_aliases(
+                temp.path()
+                    .join("missing-tool.sh")
+                    .to_str()
+                    .expect("utf8 missing tool path")
+            )
+            .expect_err("missing absolute tool rejected")
+            .to_string()
+            .contains("missing-tool.sh")
+        );
+        assert_eq!(
+            build_network_policy(&[]).expect("disabled network").mode,
+            SandboxNetworkMode::Disabled
+        );
+        assert_eq!(
+            build_network_policy(&["*".to_string()])
+                .expect("allow all network")
+                .mode,
+            SandboxNetworkMode::AllowAll
+        );
+    }
+
+    #[test]
     fn validate_provider_support_rejects_host_for_restricted_modes() {
         let policy = SandboxPolicy::default();
         let error = validate_provider_support("host", SandboxMode::WorkspaceWrite, &policy)
@@ -1456,6 +1658,12 @@ mod tests {
 
         assert!(!target_has_entries(&empty).expect("empty dir"));
         assert!(target_has_entries(&populated).expect("populated dir"));
+        assert!(
+            target_has_entries(&temp.path().join("missing"))
+                .expect_err("missing directory rejected")
+                .to_string()
+                .contains("missing")
+        );
     }
 
     #[test]
@@ -1473,5 +1681,35 @@ mod tests {
         let staged = std::fs::read_to_string(target.join("nested").join("bundle.txt"))
             .expect("read staged file");
         assert_eq!(staged, "hello");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_staged_bundle_exec_roots_and_stage_bundle_surface_io_errors() {
+        let temp = tempdir().expect("tempdir");
+        let bundle_root = temp.path().join("bundle");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&bundle_root).expect("bundle root");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        std::os::unix::fs::symlink(&outside, bundle_root.join("bin")).expect("symlink");
+
+        let error = validate_staged_bundle_exec_roots(&bundle_root, &["bin".to_string()])
+            .expect_err("symlink escape rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must stay inside the staged bundle root after staging")
+        );
+
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).expect("source root");
+        std::fs::write(source.join("file.txt"), "hello").expect("source file");
+        let stage_error =
+            stage_bundle(&source, Path::new("")).expect_err("target without parent rejected");
+        assert!(
+            stage_error
+                .to_string()
+                .contains("sandbox app root must have a parent directory")
+        );
     }
 }

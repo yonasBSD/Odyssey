@@ -439,6 +439,8 @@ mod tests {
     use async_trait::async_trait;
     use autoagents_core::agent::Context;
     use autoagents_core::agent::memory::{MemoryProvider, MemoryType};
+    #[cfg(feature = "codeact")]
+    use autoagents_core::agent::prebuilt::executor::CodeActSandboxLimits;
     use autoagents_core::agent::{AgentDeriveT, AgentHooks, HookOutcome};
     use autoagents_core::tool::{ToolCallError, ToolCallResult, ToolRuntime, ToolT};
     use autoagents_llm::LLMProvider;
@@ -799,6 +801,21 @@ mod tests {
         assert_ne!(DEFAULT_MAX_TURNS, 0);
     }
 
+    #[cfg(feature = "codeact")]
+    #[test]
+    fn codeact_builders_initialize_defaults_and_capture_limits() {
+        let app = OdysseyAgentApp::codeact(DummyAgent)
+            .max_turns(0)
+            .sandbox_limits(CodeActSandboxLimits::default());
+
+        assert_eq!(app.executor.max_turns, 1);
+        assert!(app.executor.sandbox_limits.is_some());
+        assert!(matches!(
+            app.memory,
+            MemoryConfig::SlidingWindow(DEFAULT_MEMORY_WINDOW)
+        ));
+    }
+
     #[test]
     fn builder_methods_accumulate_tools_and_replace_memory_configuration() {
         let app = OdysseyAgentApp::basic(DummyAgent)
@@ -998,5 +1015,16 @@ mod tests {
         .catch_unwind()
         .await;
         assert!(react.is_err());
+
+        #[cfg(feature = "codeact")]
+        {
+            let codeact = std::panic::AssertUnwindSafe(run_app(
+                OdysseyAgentApp::codeact(DummyAgent).without_memory(),
+                &request(),
+            ))
+            .catch_unwind()
+            .await;
+            assert!(codeact.is_err());
+        }
     }
 }

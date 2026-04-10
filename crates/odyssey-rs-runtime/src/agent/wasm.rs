@@ -385,8 +385,8 @@ fn render_output(output_json: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentHost, execute_component, from_component_descriptor, render_output,
-        resolve_module_path, validate_descriptor,
+        ComponentHost, WasmExecutorRun, execute_component, from_component_descriptor,
+        render_output, resolve_module_path, run_wasm_executor, validate_descriptor,
     };
     use async_trait::async_trait;
     use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
@@ -402,8 +402,8 @@ mod tests {
     use autoagents_protocol::Event as AutoAgentsEvent;
     use odyssey_rs_agent_abi::{
         ABI_VERSION, AgentDescriptor, HostToolCallRequest, HostToolCallResponse,
-        HostToolDefinition, LlmChatRequest, LlmChatResponse, RUNNER_CLASS, json_to_string,
-        string_to_json,
+        HostToolDefinition, HostToolSpec, LlmChatRequest, LlmChatResponse, RUNNER_CLASS,
+        RunRequest, json_to_string, string_to_json,
     };
     use odyssey_rs_protocol::{EventPayload, TurnContext};
     use pretty_assertions::assert_eq;
@@ -533,6 +533,9 @@ mod tests {
         name: &'static str,
     }
 
+    #[derive(Debug)]
+    struct FailingTool;
+
     #[async_trait]
     impl ToolRuntime for EchoTool {
         async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
@@ -547,6 +550,34 @@ mod tests {
 
         fn description(&self) -> &str {
             "echo tool"
+        }
+
+        fn args_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolRuntime for FailingTool {
+        async fn execute(&self, _args: Value) -> Result<Value, ToolCallError> {
+            Err(ToolCallError::RuntimeError(
+                std::io::Error::other("tool failed").into(),
+            ))
+        }
+    }
+
+    impl ToolT for FailingTool {
+        fn name(&self) -> &str {
+            "Write"
+        }
+
+        fn description(&self) -> &str {
+            "failing tool"
         }
 
         fn args_schema(&self) -> Value {
@@ -828,6 +859,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn component_host_llm_chat_defaults_optional_response_fields() {
+        use super::odyssey_host::Host as _;
+
+        let provider = Arc::new(RecordingLlmProvider::default());
+        let (mut host, _) = component_host(provider.clone() as Arc<dyn LLMProvider>, Vec::new());
+
+        let raw_response = host
+            .llm_chat(
+                json_to_string(&LlmChatRequest {
+                    messages_json: "[]".to_string(),
+                    tools_json: None,
+                    output_schema_json: None,
+                })
+                .expect("serialize request"),
+            )
+            .expect("llm chat should succeed");
+        let response: LlmChatResponse = string_to_json(&raw_response).expect("decode response");
+        assert_eq!(
+            response,
+            LlmChatResponse {
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls_json: None,
+            }
+        );
+
+        let calls = provider.calls.lock().expect("lock calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_names, Vec::<String>::new());
+        assert_eq!(calls[0].output_schema, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn component_host_llm_chat_rejects_invalid_payloads_and_provider_errors() {
         use super::odyssey_host::Host as _;
 
@@ -967,6 +1031,27 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_host_tool_call_surfaces_tool_runtime_errors() {
+        use super::odyssey_host::Host as _;
+
+        let llm = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+        let tools = vec![Arc::new(FailingTool) as Arc<dyn ToolT>];
+        let (mut host, _) = component_host(llm, tools);
+
+        let error = host
+            .tool_call(
+                json_to_string(&HostToolCallRequest {
+                    tool: "Write".to_string(),
+                    arguments_json: "{\"path\":\"README.md\"}".to_string(),
+                })
+                .expect("serialize request"),
+            )
+            .expect_err("failing tool should surface its runtime error");
+
+        assert_eq!(error, "Runtime Error tool failed");
+    }
+
     #[test]
     fn component_host_emit_event_rejects_invalid_json_and_forwards_payloads() {
         use super::odyssey_host::Host as _;
@@ -1006,5 +1091,104 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_wasm_executor_propagates_component_failures_without_emitting_events() {
+        let temp = tempdir().expect("tempdir");
+        let missing_path = temp.path().join("missing.wasm");
+        let llm = Arc::new(RecordingLlmProvider::default()) as Arc<dyn LLMProvider>;
+        let (sender, mut receiver) = broadcast::channel(4);
+
+        let error = run_wasm_executor(WasmExecutorRun {
+            module_path: missing_path.clone(),
+            agent_id: "demo".to_string(),
+            abi_version: ABI_VERSION.to_string(),
+            llm,
+            tools: Vec::new(),
+            session_id: Uuid::nil(),
+            turn_id: Uuid::from_u128(42),
+            sender,
+            turn_context: TurnContext::default(),
+            request: RunRequest {
+                session_id: Uuid::nil().to_string(),
+                turn_id: Uuid::from_u128(42).to_string(),
+                prompt: "hello".to_string(),
+                system_prompt: None,
+                history_json: None,
+                metadata_json: None,
+                host_tools: Vec::new(),
+            },
+        })
+        .await
+        .expect_err("missing component should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "io error at {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_wasm_executor_executes_workspace_component_and_emits_completion() {
+        let provider = Arc::new(RecordingLlmProvider {
+            text: "hello from wasm".to_string(),
+            ..RecordingLlmProvider::default()
+        });
+        let module_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bundles/odyssey-agent/agents/odyssey-agent/module.wasm");
+        let (sender, mut receiver) = broadcast::channel(8);
+
+        let message = run_wasm_executor(WasmExecutorRun {
+            module_path,
+            agent_id: "odyssey-agent".to_string(),
+            abi_version: ABI_VERSION.to_string(),
+            llm: provider.clone() as Arc<dyn LLMProvider>,
+            tools: vec![Arc::new(EchoTool { name: "Read" }) as Arc<dyn ToolT>],
+            session_id: Uuid::nil(),
+            turn_id: Uuid::from_u128(7),
+            sender,
+            turn_context: TurnContext::default(),
+            request: RunRequest {
+                session_id: Uuid::nil().to_string(),
+                turn_id: Uuid::from_u128(7).to_string(),
+                prompt: "Say hello".to_string(),
+                system_prompt: Some("Stay concise".to_string()),
+                history_json: None,
+                metadata_json: None,
+                host_tools: vec![HostToolSpec {
+                    name: "Read".to_string(),
+                    description: "Read a file".to_string(),
+                    args_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        }
+                    }),
+                    output_schema: None,
+                }],
+            },
+        })
+        .await
+        .expect("wasm executor should succeed");
+
+        assert_eq!(message, "hello from wasm");
+        assert_eq!(provider.calls.lock().expect("lock calls").len(), 1);
+
+        for _ in 0..8 {
+            let event = receiver.recv().await.expect("executor event");
+            if matches!(
+                event.payload,
+                EventPayload::TurnCompleted { ref message, .. } if message == "hello from wasm"
+            ) {
+                return;
+            }
+        }
+
+        panic!("expected turn completed event");
     }
 }

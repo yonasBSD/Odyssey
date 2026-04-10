@@ -490,12 +490,18 @@ fn _payload_digest(root: &Path) -> Result<String, BundleError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BundleBuilder, BundleProject, parse_component_artifact_path};
+    use super::{
+        _payload_digest, BundleBuilder, BundleProject, agent_entrypoint, io_err,
+        parse_component_artifact_path, stage_component_artifact, validate_path_component,
+    };
     use crate::constants::BUNDLE_INSTALL_LAYOUT_DIR_NAME;
     use crate::layout::{read_config, read_manifest};
     use crate::test_support::write_bundle_project;
+    use odyssey_rs_manifest::AgentSpec;
     use pretty_assertions::assert_eq;
     use std::fs;
+    use std::io::ErrorKind;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -650,5 +656,134 @@ mod tests {
                 .expect("artifact path"),
             artifact_path
         );
+    }
+
+    #[test]
+    fn bundle_project_load_reports_missing_readme() {
+        let temp = tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(&project_root, "demo", "0.1.0", "logo.txt", "liquidos");
+        fs::remove_file(project_root.join("README.md")).expect("remove readme");
+
+        let error = BundleProject::load(&project_root).expect_err("missing readme should fail");
+        assert!(matches!(error, crate::BundleError::Manifest(_)));
+        assert!(error.to_string().contains("README.md"));
+    }
+
+    #[test]
+    fn agent_entrypoint_prefers_program_entrypoint_then_fallback() {
+        let mut agent = AgentSpec::default();
+        agent.program.entrypoint = "compiled/agent.wasm".to_string();
+        assert_eq!(
+            agent_entrypoint(&agent, Some("agents/demo/module.wasm")),
+            Some("compiled/agent.wasm")
+        );
+
+        agent.program.entrypoint.clear();
+        assert_eq!(
+            agent_entrypoint(&agent, Some("agents/demo/module.wasm")),
+            Some("agents/demo/module.wasm")
+        );
+        assert_eq!(agent_entrypoint(&agent, Some("   ")), None);
+    }
+
+    #[test]
+    fn stage_component_artifact_copies_into_nested_parent_directories() {
+        let temp = tempdir().expect("tempdir");
+        let artifact_path = temp.path().join("artifact.wasm");
+        let module_path = temp
+            .path()
+            .join("nested")
+            .join("component")
+            .join("agent.wasm");
+        fs::write(&artifact_path, b"wasm-bytes").expect("write artifact");
+
+        stage_component_artifact(&artifact_path, &module_path).expect("stage artifact");
+
+        assert_eq!(
+            fs::read(&module_path).expect("read staged module"),
+            b"wasm-bytes"
+        );
+    }
+
+    #[test]
+    fn parse_component_artifact_path_rejects_missing_wasm_filenames() {
+        let temp = tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("Cargo.toml");
+        fs::write(
+            &manifest_path,
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let output = format!(
+            "{{\"reason\":\"compiler-artifact\",\"manifest_path\":\"{}\",\"target\":{{\"kind\":[\"cdylib\"]}},\"filenames\":[]}}\n",
+            manifest_path.display()
+        );
+
+        let error = parse_component_artifact_path(output.as_bytes(), &manifest_path)
+            .expect_err("missing wasm path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not determine component artifact path")
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_empty_absolute_and_traversal_values() {
+        for value in ["", "/absolute", "../escape"] {
+            let error = validate_path_component(value, "bundle namespace")
+                .expect_err("invalid component should fail");
+            assert!(error.to_string().contains("bundle namespace"));
+        }
+        validate_path_component("valid-name", "bundle namespace").expect("valid component");
+        validate_path_component("nested/path", "bundle namespace")
+            .expect("normal relative path components are allowed");
+    }
+
+    #[test]
+    fn bundle_metadata_default_agent_returns_manifest_default() {
+        let temp = tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        let output_root = temp.path().join("output");
+        fs::create_dir_all(&project_root).expect("create project");
+        write_bundle_project(&project_root, "demo", "0.1.0", "logo.txt", "liquidos");
+        let project = BundleProject::load(&project_root).expect("load project");
+        let metadata = BundleBuilder::new(project)
+            .with_namespace("team")
+            .build(&output_root)
+            .expect("build bundle")
+            .metadata;
+
+        assert_eq!(
+            metadata.default_agent().map(|agent| agent.id.as_str()),
+            Some("demo")
+        );
+    }
+
+    #[test]
+    fn io_err_wraps_the_original_path_and_message() {
+        let missing = Path::new("/path/that/does/not/exist");
+        let wrapped = io_err(
+            missing,
+            std::io::Error::new(ErrorKind::NotFound, "missing file"),
+        );
+
+        assert_eq!(
+            wrapped.to_string(),
+            "io error at /path/that/does/not/exist: missing file"
+        );
+    }
+
+    #[test]
+    fn payload_digest_hashes_the_current_directory_payload() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(temp.path().join("README.md"), "# demo\n").expect("write readme");
+
+        let digest = _payload_digest(temp.path()).expect("payload digest");
+
+        assert!(digest.starts_with("sha256:"));
     }
 }

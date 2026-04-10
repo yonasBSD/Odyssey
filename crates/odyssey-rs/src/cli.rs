@@ -492,16 +492,25 @@ mod tests {
         Cli, Command, build_runtime_config, dangerous_sandbox_mode_enabled, default_bundle_id,
         execute_command, handle_build, handle_bundles, handle_export, handle_import, handle_init,
         handle_inspect, handle_session, handle_sessions, hub_override, remote_command_supported,
-        validate_remote_usage,
+        run_cli, validate_remote_usage,
     };
+    use crate::remote::RemoteRuntimeClient;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
     use clap::Parser;
     use odyssey_rs_bundle::BundleStore;
     use odyssey_rs_protocol::{DEFAULT_HUB_URL, SandboxMode, SessionSpec};
     use odyssey_rs_runtime::{OdysseyRuntime, RuntimeConfig};
     use pretty_assertions::assert_eq;
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
 
     fn runtime_config(root: &Path) -> RuntimeConfig {
         RuntimeConfig {
@@ -590,6 +599,126 @@ spec:
             "hello world\n",
         )
         .expect("write resource");
+    }
+
+    #[derive(Clone, Default)]
+    struct RemoteState {
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RunSyncBody {
+        input: odyssey_rs_protocol::Task,
+    }
+
+    async fn spawn_remote() -> (RemoteRuntimeClient, RemoteState) {
+        let state = RemoteState::default();
+        let app = Router::new()
+            .route(
+                "/sessions",
+                get(list_remote_sessions).post(create_remote_session),
+            )
+            .route(
+                "/sessions/{id}",
+                get(get_remote_session).delete(delete_remote_session),
+            )
+            .route("/sessions/{id}/run-sync", post(run_remote_sync))
+            .route("/bundles", get(list_remote_bundles))
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test remote");
+        });
+
+        let client =
+            RemoteRuntimeClient::new(format!("http://{addr}/")).expect("construct remote client");
+        (client, state)
+    }
+
+    async fn create_remote_session(
+        State(state): State<RemoteState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .requests
+            .lock()
+            .expect("lock requests")
+            .push(("create_session".to_string(), body));
+        Json(json!({
+            "id": Uuid::nil(),
+            "agent_id": "alpha",
+            "message_count": 0,
+            "created_at": "2026-04-10T00:00:00Z"
+        }))
+    }
+
+    async fn list_remote_sessions() -> Json<Value> {
+        Json(json!([{
+            "id": Uuid::nil(),
+            "agent_id": "alpha",
+            "message_count": 2,
+            "created_at": "2026-04-10T00:00:00Z"
+        }]))
+    }
+
+    async fn get_remote_session(AxumPath(id): AxumPath<Uuid>) -> Json<Value> {
+        Json(json!({
+            "id": id,
+            "agent_id": "alpha",
+            "bundle_ref": "local/demo@0.1.0",
+            "model_id": "openai/gpt-4.1-mini",
+            "sandbox": null,
+            "created_at": "2026-04-10T00:00:00Z",
+            "messages": [{
+                "role": "user",
+                "content": "hello"
+            }]
+        }))
+    }
+
+    async fn delete_remote_session(
+        State(state): State<RemoteState>,
+        AxumPath(id): AxumPath<Uuid>,
+    ) -> (StatusCode, String) {
+        state
+            .requests
+            .lock()
+            .expect("lock requests")
+            .push(("delete_session".to_string(), json!({ "id": id })));
+        (StatusCode::NO_CONTENT, String::default())
+    }
+
+    async fn run_remote_sync(
+        State(state): State<RemoteState>,
+        AxumPath(id): AxumPath<Uuid>,
+        Json(body): Json<RunSyncBody>,
+    ) -> Json<Value> {
+        state.requests.lock().expect("lock requests").push((
+            "run_sync".to_string(),
+            json!({
+                "session_id": id,
+                "prompt": body.input.prompt,
+                "system_prompt": body.input.system_prompt
+            }),
+        ));
+        Json(json!({
+            "session_id": id,
+            "turn_id": Uuid::from_u128(1),
+            "response": "remote output"
+        }))
+    }
+
+    async fn list_remote_bundles() -> Json<Value> {
+        Json(json!([{
+            "namespace": "team",
+            "id": "demo",
+            "version": "1.2.3",
+            "path": "/bundles/team/demo/1.2.3"
+        }]))
     }
 
     #[test]
@@ -771,6 +900,109 @@ spec:
         assert_eq!(
             default_bundle_id(Path::new("./bundles/...Rust   Agent---Beta...")),
             "rust-agent-beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_routes_supported_remote_variants() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = OdysseyRuntime::new(runtime_config(temp.path())).expect("runtime");
+        let config = runtime.config().clone();
+        let bundles = runtime.bundle_store();
+        let (remote, state) = spawn_remote().await;
+
+        execute_command(Command::Bundles, &config, &runtime, &bundles, Some(&remote))
+            .await
+            .expect("dispatch remote bundles");
+        execute_command(
+            Command::Sessions,
+            &config,
+            &runtime,
+            &bundles,
+            Some(&remote),
+        )
+        .await
+        .expect("dispatch remote sessions");
+        execute_command(
+            Command::Session {
+                id: Uuid::nil(),
+                delete: false,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            Some(&remote),
+        )
+        .await
+        .expect("dispatch remote session fetch");
+        execute_command(
+            Command::Session {
+                id: Uuid::nil(),
+                delete: true,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            Some(&remote),
+        )
+        .await
+        .expect("dispatch remote session delete");
+        execute_command(
+            Command::Run {
+                reference: "local/demo@0.1.0".to_string(),
+                prompt: "hello remote".to_string(),
+                dangerous_sandbox_mode: false,
+            },
+            &config,
+            &runtime,
+            &bundles,
+            Some(&remote),
+        )
+        .await
+        .expect("dispatch remote run");
+
+        let requests = state.requests.lock().expect("lock requests");
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ("delete_session".to_string(), json!({ "id": Uuid::nil() })),
+                (
+                    "create_session".to_string(),
+                    json!({
+                        "bundle_ref": { "reference": "local/demo@0.1.0" },
+                        "agent_id": null,
+                        "model": null,
+                        "sandbox": null,
+                        "metadata": {}
+                    })
+                ),
+                (
+                    "run_sync".to_string(),
+                    json!({
+                        "session_id": Uuid::nil(),
+                        "prompt": "hello remote",
+                        "system_prompt": null
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cli_rejects_remote_for_unsupported_commands_before_runtime_setup() {
+        let error = run_cli(Cli {
+            remote: Some("http://127.0.0.1:9000".to_string()),
+            command: Command::Build {
+                path: ".".to_string(),
+                output: None,
+            },
+        })
+        .await
+        .expect_err("unsupported remote command should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "--remote is not supported with this command"
         );
     }
 

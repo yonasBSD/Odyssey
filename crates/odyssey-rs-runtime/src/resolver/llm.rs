@@ -729,6 +729,30 @@ mod tests {
             LocalLLMProvider::from("llama_cpp"),
             LocalLLMProvider::LlamaCpp
         );
+        assert_eq!(
+            LocalLLMProvider::from("  LLAMA-CPP  "),
+            LocalLLMProvider::LlamaCpp
+        );
+        assert_eq!(
+            LocalLLMProvider::from("local-only"),
+            LocalLLMProvider::Unknown
+        );
+    }
+
+    #[test]
+    fn split_mode_config_maps_to_llamacpp_split_modes() {
+        assert_eq!(
+            LlamaCppSplitMode::from(LlamaCppSplitModeConfig::None),
+            LlamaCppSplitMode::None
+        );
+        assert_eq!(
+            LlamaCppSplitMode::from(LlamaCppSplitModeConfig::Layer),
+            LlamaCppSplitMode::Layer
+        );
+        assert_eq!(
+            LlamaCppSplitMode::from(LlamaCppSplitModeConfig::Row),
+            LlamaCppSplitMode::Row
+        );
     }
 
     #[test]
@@ -945,6 +969,127 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("invalid model config"));
         assert!(err.to_string().contains("bad-value"));
+    }
+
+    #[tokio::test]
+    async fn build_llm_rejects_unknown_provider_ids() {
+        let spec = model_spec("unsupported-provider", None);
+        let resolver = LLMResolver::new(&spec);
+
+        let error = match resolver.build_llm().await {
+            Ok(_) => panic!("unknown provider should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RuntimeError::Unsupported(message)
+                if message == "unsupported model provider: unsupported-provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_local_llm_rejects_unknown_local_provider_ids() {
+        let spec = model_spec("llama-rs", None);
+        let resolver = LLMResolver::new(&spec);
+
+        let error = match resolver.build_local_llm(LocalLLMProvider::Unknown).await {
+            Ok(_) => panic!("unknown local provider should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RuntimeError::Unsupported(message)
+                if message == "unsupported model provider: llama-rs"
+        ));
+    }
+
+    #[test]
+    fn apply_reasoning_effort_accepts_known_values_and_rejects_invalid_ones() {
+        let spec = model_spec("openai", None);
+        let resolver = LLMResolver::new(&spec);
+
+        for effort in ["low", "medium", "high"] {
+            let builder = LLMBuilder::<OpenAI>::new()
+                .api_key("key")
+                .model("test-model");
+            let config = CloudLLMConfig {
+                reasoning_effort: Some(effort.to_string()),
+                ..CloudLLMConfig::default()
+            };
+            resolver
+                .apply_reasoning_effort(builder, &config, "openai")
+                .expect("supported reasoning effort");
+        }
+
+        let error = match resolver.apply_reasoning_effort(
+            LLMBuilder::<OpenAI>::new()
+                .api_key("key")
+                .model("test-model"),
+            &CloudLLMConfig {
+                reasoning_effort: Some("extreme".to_string()),
+                ..CloudLLMConfig::default()
+            },
+            "openai",
+        ) {
+            Ok(_) => panic!("invalid reasoning effort should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires config.reasoning_effort to be one of [low, medium, high]")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_llamacpp_llm_surfaces_provider_failures_after_config_is_applied() {
+        let spec = model_spec(
+            "llama_cpp",
+            Some(json!({
+                "hf_repo_id": "invalid repo id",
+                "hf_filename": "model.gguf",
+                "chat_template": "chatml",
+                "system_prompt": "stay concise",
+                "force_json_grammar": true,
+                "reasoning_format": "none",
+                "max_tokens": 64,
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "top_k": 16,
+                "repeat_penalty": 1.1,
+                "frequency_penalty": 0.1,
+                "presence_penalty": 0.1,
+                "repeat_last_n": 8,
+                "seed": 7,
+                "n_ctx": 512,
+                "n_batch": 32,
+                "n_ubatch": 16,
+                "n_threads": 2,
+                "n_threads_batch": 2,
+                "n_gpu_layers": 0,
+                "main_gpu": 0,
+                "split_mode": "none",
+                "use_mlock": false,
+                "devices": [0]
+            })),
+        );
+        let resolver = LLMResolver::new(&spec);
+
+        assert!(resolver.build_llamacpp_llm().await.is_err());
+    }
+
+    #[test]
+    fn map_provider_error_wraps_provider_messages() {
+        let error = LLMResolver::map_provider_error(
+            autoagents_llm::error::LLMError::ProviderError("boom".to_string()),
+        );
+
+        assert!(matches!(
+            error,
+            RuntimeError::Executor(message) if message == "Provider Error: boom"
+        ));
     }
 
     #[tokio::test]

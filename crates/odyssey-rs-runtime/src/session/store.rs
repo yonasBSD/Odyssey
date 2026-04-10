@@ -463,13 +463,17 @@ fn sync_directory(path: &Path) -> Result<(), RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionRecord, SessionStore, TurnChatMessageRecord, TurnRecord};
-    use autoagents_llm::chat::ChatRole;
+    use super::{
+        SessionRecord, SessionStore, TurnChatMessageKind, TurnChatMessageRecord, TurnRecord,
+    };
+    use autoagents_llm::chat::{ChatRole, MessageType};
+    use autoagents_llm::{FunctionCall, ToolCall};
     use chrono::Utc;
-    use odyssey_rs_protocol::Task;
+    use odyssey_rs_protocol::{EventMsg, EventPayload, Task};
     use pretty_assertions::assert_eq;
     use serde_json::{Value, json};
     use std::fs;
+    use std::time::Duration;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -671,5 +675,148 @@ mod tests {
 
         assert!(error.to_string().contains("io error"));
         assert!(store.get(session.id).expect("session").turns.is_empty());
+    }
+
+    #[test]
+    fn session_records_default_model_provider_and_round_trip_chat_messages() {
+        let record: SessionRecord = serde_json::from_value(json!({
+            "id": Uuid::new_v4(),
+            "bundle_ref": "demo@latest",
+            "agent_id": "demo",
+            "model_id": "gpt-4.1-mini",
+            "created_at": Utc::now(),
+            "turns": []
+        }))
+        .expect("deserialize session record");
+        assert_eq!(record.model_provider, "openai");
+
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Read".to_string(),
+                arguments: "{\"path\":\"README.md\"}".to_string(),
+            },
+        };
+        let text =
+            TurnChatMessageRecord::from_text(ChatRole::Assistant, "hello").into_chat_message();
+        assert_eq!(text.role, ChatRole::Assistant);
+        assert!(matches!(text.message_type, MessageType::Text));
+        assert_eq!(text.content, "hello");
+
+        let tool_use = TurnChatMessageRecord::from_tool_calls(
+            ChatRole::Assistant,
+            TurnChatMessageKind::ToolUse,
+            vec![tool_call.clone()],
+        )
+        .into_chat_message();
+        match tool_use.message_type {
+            MessageType::ToolUse(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call-1");
+                assert_eq!(calls[0].function.name, "Read");
+            }
+            other => panic!("unexpected message type: {other:?}"),
+        }
+        assert_eq!(tool_use.content, "");
+
+        let tool_result = TurnChatMessageRecord::from_tool_calls(
+            ChatRole::Tool,
+            TurnChatMessageKind::ToolResult,
+            vec![tool_call.clone()],
+        )
+        .into_chat_message();
+        match tool_result.message_type {
+            MessageType::ToolResult(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call-1");
+                assert_eq!(calls[0].function.arguments, "{\"path\":\"README.md\"}");
+            }
+            other => panic!("unexpected message type: {other:?}"),
+        }
+        assert_eq!(tool_result.content, "");
+
+        let parsed: TurnChatMessageRecord = serde_json::from_value(json!({
+            "role": "assistant",
+            "kind": "tool_use",
+            "tool_calls": [{
+                "id": "call-1",
+                "name": "Read",
+                "arguments": "{}"
+            }]
+        }))
+        .expect("deserialize chat message");
+        assert_eq!(parsed.tool_calls[0].call_type, "function");
+    }
+
+    #[test]
+    fn turn_records_normalize_and_store_helpers_cover_list_subscribe_sender_and_delete() {
+        let temp = tempdir().expect("tempdir");
+        let store = SessionStore::new(temp.path()).expect("store");
+        let first = store
+            .create(
+                "demo@latest".to_string(),
+                "alpha".to_string(),
+                "openai".to_string(),
+                "gpt-4.1-mini".to_string(),
+                None,
+                None,
+            )
+            .expect("first session");
+        std::thread::sleep(Duration::from_millis(2));
+        let second = store
+            .create(
+                "demo@latest".to_string(),
+                "beta".to_string(),
+                "openai".to_string(),
+                "gpt-4.1-mini".to_string(),
+                None,
+                None,
+            )
+            .expect("second session");
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[1].id, first.id);
+
+        let mut receiver = store.subscribe(first.id).expect("subscribe");
+        let sender = store.sender(first.id).expect("sender");
+        sender
+            .send(EventMsg {
+                id: Uuid::new_v4(),
+                session_id: first.id,
+                created_at: Utc::now(),
+                payload: EventPayload::TurnCompleted {
+                    turn_id: Uuid::new_v4(),
+                    message: "done".to_string(),
+                },
+            })
+            .expect("send event");
+        let event = receiver.try_recv().expect("recv event");
+        assert!(matches!(
+            event.payload,
+            EventPayload::TurnCompleted { ref message, .. } if message == "done"
+        ));
+
+        let mut turn = TurnRecord {
+            turn_id: Uuid::new_v4(),
+            prompt: "hello".to_string(),
+            response: "world".to_string(),
+            chat_history: vec![
+                TurnChatMessageRecord::from_text(ChatRole::User, "hello"),
+                TurnChatMessageRecord::from_text(ChatRole::Assistant, "world"),
+            ],
+            created_at: Utc::now(),
+        };
+        assert!(turn.normalize());
+        assert_eq!(turn.prompt, "");
+        assert_eq!(turn.response, "");
+
+        store.delete(first.id).expect("delete session");
+        assert!(store.get(first.id).is_err());
+        assert!(store.subscribe(first.id).is_err());
+        assert!(store.sender(first.id).is_err());
+        assert!(!temp.path().join(format!("{}.json", first.id)).exists());
     }
 }

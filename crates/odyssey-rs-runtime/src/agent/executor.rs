@@ -603,13 +603,256 @@ pub fn emit(sender: &broadcast::Sender<EventMsg>, session_id: Uuid, payload: Eve
 
 #[cfg(test)]
 mod tests {
-    use super::{AutoagentsEventBridge, emit, parse_json_value};
+    use super::{
+        AutoagentsEventBridge, ExecutorRun, OdysseyAgent, emit, forward_autoagents_events,
+        parse_json_value, run_executor, stringify_exec_output,
+    };
+    use async_trait::async_trait;
+    use autoagents_core::agent::memory::SlidingWindowMemory;
+    use autoagents_core::agent::{AgentDeriveT, AgentHooks, Context, HookOutcome, task::Task};
+    use autoagents_core::tool::{ToolCallError, ToolCallResult, ToolRuntime, ToolT};
+    use autoagents_llm::LLMProvider;
+    use autoagents_llm::ToolCall;
+    use autoagents_llm::chat::{
+        ChatMessage, ChatProvider, ChatResponse, StreamChoice, StreamChunk, StreamDelta,
+        StreamResponse, StructuredOutputFormat,
+    };
+    use autoagents_llm::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use autoagents_llm::embedding::EmbeddingProvider;
+    use autoagents_llm::error::LLMError;
+    use autoagents_llm::models::{ModelListRequest, ModelListResponse, ModelsProvider};
+    use futures_util::stream;
     use odyssey_rs_protocol::{AutoAgentsEvent, AutoAgentsStreamChunk};
-    use odyssey_rs_protocol::{EventPayload, ExecStream, TurnContext};
+    use odyssey_rs_protocol::{EventMsg, EventPayload, ExecStream, TurnContext};
     use pretty_assertions::assert_eq;
     use serde_json::{Value, json};
+    use std::fmt;
+    use std::sync::Arc;
     use tokio::sync::broadcast;
     use uuid::Uuid;
+
+    #[derive(Clone, Debug, Default)]
+    struct NoopLlm;
+
+    #[derive(Debug)]
+    struct EmptyChatResponse;
+
+    #[derive(Clone, Debug)]
+    struct StaticTextLlm {
+        text: String,
+    }
+
+    #[derive(Debug)]
+    struct StaticTextChatResponse {
+        text: String,
+    }
+
+    impl fmt::Display for EmptyChatResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("")
+        }
+    }
+
+    impl ChatResponse for EmptyChatResponse {
+        fn text(&self) -> Option<String> {
+            Some(String::default())
+        }
+
+        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+            None
+        }
+    }
+
+    impl fmt::Display for StaticTextChatResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.text)
+        }
+    }
+
+    impl ChatResponse for StaticTextChatResponse {
+        fn text(&self) -> Option<String> {
+            Some(self.text.clone())
+        }
+
+        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for NoopLlm {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            Ok(Box::new(EmptyChatResponse))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for NoopLlm {
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<CompletionResponse, LLMError> {
+            Ok(CompletionResponse {
+                text: String::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for NoopLlm {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ModelsProvider for NoopLlm {
+        async fn list_models(
+            &self,
+            _request: Option<&ModelListRequest>,
+        ) -> Result<Box<dyn ModelListResponse>, LLMError> {
+            Err(LLMError::ProviderError("unused in tests".to_string()))
+        }
+    }
+
+    impl LLMProvider for NoopLlm {}
+
+    #[async_trait]
+    impl ChatProvider for StaticTextLlm {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            Ok(Box::new(StaticTextChatResponse {
+                text: self.text.clone(),
+            }))
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, LLMError>> + Send>>,
+            LLMError,
+        > {
+            let stream = stream::iter(vec![Ok(self.text.clone())]);
+            Ok(Box::pin(stream))
+        }
+
+        async fn chat_stream_struct(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures_util::Stream<Item = Result<StreamResponse, LLMError>> + Send>,
+            >,
+            LLMError,
+        > {
+            let stream = stream::iter(vec![Ok(StreamResponse {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: Some(self.text.clone()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                }],
+                usage: None,
+            })]);
+            Ok(Box::pin(stream))
+        }
+
+        async fn chat_stream_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[autoagents_llm::chat::Tool]>,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>,
+            >,
+            LLMError,
+        > {
+            let stream = stream::iter(vec![
+                Ok(StreamChunk::Text(self.text.clone())),
+                Ok(StreamChunk::Done {
+                    stop_reason: "end_turn".to_string(),
+                }),
+            ]);
+            Ok(Box::pin(stream))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StaticTextLlm {
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _json_schema: Option<StructuredOutputFormat>,
+        ) -> Result<CompletionResponse, LLMError> {
+            Ok(CompletionResponse {
+                text: self.text.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for StaticTextLlm {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ModelsProvider for StaticTextLlm {
+        async fn list_models(
+            &self,
+            _request: Option<&ModelListRequest>,
+        ) -> Result<Box<dyn ModelListResponse>, LLMError> {
+            Err(LLMError::ProviderError("unused in tests".to_string()))
+        }
+    }
+
+    impl LLMProvider for StaticTextLlm {}
+
+    #[derive(Debug)]
+    struct DummyTool;
+
+    #[async_trait]
+    impl ToolRuntime for DummyTool {
+        async fn execute(&self, _args: Value) -> Result<Value, ToolCallError> {
+            Ok(Value::Null)
+        }
+    }
+
+    impl ToolT for DummyTool {
+        fn name(&self) -> &str {
+            "Read"
+        }
+
+        fn description(&self) -> &str {
+            "Read a file"
+        }
+
+        fn args_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            })
+        }
+    }
 
     #[test]
     fn parse_json_value_falls_back_to_string() {
@@ -618,6 +861,189 @@ mod tests {
             parse_json_value("not-json"),
             Value::String("not-json".to_string())
         );
+        assert_eq!(stringify_exec_output(json!("done")), "done");
+        assert_eq!(
+            stringify_exec_output(json!({ "value": 1 })),
+            "{\"value\":1}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_executor_rejects_unknown_executor_ids() {
+        let (sender, _) = broadcast::channel(1);
+        let error = run_executor(ExecutorRun {
+            executor_id: "unknown".to_string(),
+            llm: Arc::new(NoopLlm),
+            system_prompt: "stay concise".to_string(),
+            task: Task::new("hello"),
+            memory: None,
+            tools: Vec::new(),
+            session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            sender,
+            turn_context: TurnContext::default(),
+        })
+        .await
+        .expect_err("unknown executor should fail");
+
+        assert!(error.to_string().contains("unsupported prebuilt executor"));
+    }
+
+    async fn run_supported_executor(executor_id: &str) -> (String, EventMsg) {
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let (sender, mut receiver) = broadcast::channel(64);
+        let llm = Arc::new(StaticTextLlm {
+            text: format!("{executor_id} response"),
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_executor(ExecutorRun {
+                executor_id: executor_id.to_string(),
+                llm,
+                system_prompt: "stay concise".to_string(),
+                task: Task::new("hello"),
+                memory: Some(Box::new(SlidingWindowMemory::new(2))),
+                tools: vec![Arc::new(DummyTool) as Arc<dyn ToolT>],
+                session_id,
+                turn_id,
+                sender,
+                turn_context: TurnContext::default(),
+            }),
+        )
+        .await
+        .expect("executor timed out")
+        .expect("executor should succeed");
+
+        loop {
+            let event = receiver.recv().await.expect("completion event");
+            if matches!(event.payload, EventPayload::TurnCompleted { .. }) {
+                return (response, event);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_executor_supports_react_streaming_path() {
+        let (response, event) = run_supported_executor("react").await;
+
+        assert_eq!(response, "react response");
+        assert!(matches!(
+            event.payload,
+            EventPayload::TurnCompleted { ref message, .. } if message == "react response"
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_executor_supports_codeact_streaming_path() {
+        let (response, event) = run_supported_executor("codeact").await;
+
+        assert_eq!(response, "codeact response");
+        assert!(matches!(
+            event.payload,
+            EventPayload::TurnCompleted { ref message, .. } if message == "codeact response"
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_autoagents_events_stops_after_terminal_events() {
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let (sender, mut receiver) = broadcast::channel(8);
+        let events = stream::iter(vec![
+            AutoAgentsEvent::TurnStarted {
+                sub_id: Uuid::new_v4(),
+                actor_id: Uuid::new_v4(),
+                turn_number: 1,
+                max_turns: 4,
+            },
+            AutoAgentsEvent::TaskError {
+                sub_id: Uuid::new_v4(),
+                actor_id: Uuid::new_v4(),
+                error: "failed".to_string(),
+            },
+            AutoAgentsEvent::TurnStarted {
+                sub_id: Uuid::new_v4(),
+                actor_id: Uuid::new_v4(),
+                turn_number: 2,
+                max_turns: 4,
+            },
+        ]);
+
+        forward_autoagents_events(
+            Box::pin(events),
+            sender,
+            session_id,
+            turn_id,
+            TurnContext::default(),
+        )
+        .await;
+
+        let started = receiver.recv().await.expect("turn started event");
+        assert!(matches!(
+            started.payload,
+            EventPayload::TurnStarted { turn_id: id, .. } if id == turn_id
+        ));
+
+        let errored = receiver.recv().await.expect("error event");
+        assert!(matches!(
+            errored.payload,
+            EventPayload::Error { turn_id: Some(id), message } if id == turn_id && message == "failed"
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn odyssey_agent_exposes_metadata_tools_and_default_hooks() {
+        let agent = OdysseyAgent::new(
+            "system prompt".to_string(),
+            vec![Arc::new(DummyTool) as Arc<dyn ToolT>],
+        );
+        let context = Context::new(Arc::new(NoopLlm), None);
+        let task = Task::new("hello");
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: autoagents_llm::FunctionCall {
+                name: "Read".to_string(),
+                arguments: "{\"path\":\"README.md\"}".to_string(),
+            },
+        };
+
+        assert_eq!(agent.description(), "system prompt");
+        assert_eq!(agent.output_schema(), None);
+        assert_eq!(agent.name(), "odyssey-agent");
+        assert_eq!(
+            agent
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["Read".to_string()]
+        );
+        assert!(matches!(
+            agent.on_run_start(&task, &context).await,
+            HookOutcome::Continue
+        ));
+        assert!(matches!(
+            agent.on_tool_call(&tool_call, &context).await,
+            HookOutcome::Continue
+        ));
+        agent
+            .on_tool_result(
+                &tool_call,
+                &ToolCallResult {
+                    tool_name: "Read".to_string(),
+                    success: true,
+                    arguments: json!({ "path": "README.md" }),
+                    result: json!({ "content": "hello" }),
+                },
+                &context,
+            )
+            .await;
+        agent
+            .on_tool_error(&tool_call, json!({ "message": "boom" }), &context)
+            .await;
     }
 
     #[test]

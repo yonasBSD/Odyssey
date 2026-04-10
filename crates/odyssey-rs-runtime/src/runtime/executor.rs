@@ -438,7 +438,7 @@ mod tests {
         ManifestVersion, ProviderKind,
     };
     use odyssey_rs_protocol::{EventMsg, EventPayload};
-    use odyssey_rs_protocol::{ModelSpec, Task, TurnContextOverride};
+    use odyssey_rs_protocol::{ModelSpec, SessionSandboxOverlay, Task, TurnContextOverride};
     use odyssey_rs_sandbox::SandboxMode;
     use odyssey_rs_tools::WorkspaceMount;
     use pretty_assertions::assert_eq;
@@ -564,6 +564,21 @@ mod tests {
     }
 
     #[test]
+    fn effective_sandbox_mode_uses_session_overlay_when_runtime_override_is_absent() {
+        assert_eq!(
+            effective_sandbox_mode(
+                &manifest(SandboxMode::WorkspaceWrite),
+                Some(&SessionSandboxOverlay {
+                    mode: Some(SandboxMode::DangerFullAccess),
+                    ..SessionSandboxOverlay::default()
+                }),
+                None
+            ),
+            SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
     fn build_turn_context_applies_overrides() {
         let context = build_turn_context(
             "/workspace/demo".to_string(),
@@ -666,6 +681,66 @@ mod tests {
         assert_eq!(model.provider, "anthropic");
         assert_eq!(model.name, "claude-sonnet");
         assert_eq!(model.config, Some(json!({ "temperature": 0.2 })));
+    }
+
+    #[test]
+    fn resolve_model_spec_uses_session_config_for_matching_and_non_matching_models() {
+        let resolved = ResolvedBundle {
+            install_path: std::path::PathBuf::from("/workspace/demo"),
+            namespace: "local".to_string(),
+            manifest: manifest(SandboxMode::WorkspaceWrite),
+            agent: agent(ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-5".to_string(),
+                config: Some(json!({ "reasoning_effort": "medium" })),
+            }),
+            agents: Vec::new(),
+            model: ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-5".to_string(),
+                config: Some(json!({ "reasoning_effort": "medium" })),
+            },
+        };
+
+        let matching_session = SessionRecord {
+            id: Uuid::new_v4(),
+            bundle_ref: "demo@latest".to_string(),
+            agent_id: "demo".to_string(),
+            model_provider: "openai".to_string(),
+            model_id: "gpt-5".to_string(),
+            model_config: Some(json!({ "reasoning_effort": "low" })),
+            sandbox: None,
+            created_at: Utc::now(),
+            turns: Vec::new(),
+        };
+        let alternate_session = SessionRecord {
+            id: Uuid::new_v4(),
+            bundle_ref: "demo@latest".to_string(),
+            agent_id: "demo".to_string(),
+            model_provider: "anthropic".to_string(),
+            model_id: "claude-sonnet-4-5".to_string(),
+            model_config: Some(json!({ "temperature": 0.2 })),
+            sandbox: None,
+            created_at: Utc::now(),
+            turns: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_model_spec(&matching_session, &resolved, None),
+            ModelSpec {
+                provider: "openai".to_string(),
+                name: "gpt-5".to_string(),
+                config: Some(json!({ "reasoning_effort": "low" })),
+            }
+        );
+        assert_eq!(
+            resolve_model_spec(&alternate_session, &resolved, None),
+            ModelSpec {
+                provider: "anthropic".to_string(),
+                name: "claude-sonnet-4-5".to_string(),
+                config: Some(json!({ "temperature": 0.2 })),
+            }
+        );
     }
 
     #[test]

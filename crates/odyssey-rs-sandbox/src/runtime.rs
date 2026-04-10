@@ -626,7 +626,8 @@ fn has_same_sanitized_prefix(left: &str, right: &str) -> bool {
 mod tests {
     use super::{
         SandboxCellKey, SandboxCellKind, SandboxCellSpec, SandboxRuntime,
-        augment_managed_cell_policy, has_same_sanitized_prefix, sanitize_segment,
+        augment_managed_cell_policy, ensure_child_directory, has_same_sanitized_prefix,
+        remove_directory_tree_if_safe, sanitize_segment,
     };
     use crate::{
         AccessDecision, AccessMode, CommandResult, CommandSpec, LocalSandboxProvider,
@@ -678,6 +679,8 @@ mod tests {
             .expect("second lease");
 
         assert_eq!(first.handle().id, second.handle().id);
+        assert_eq!(first.mode(), SandboxMode::DangerFullAccess);
+        assert_eq!(first.policy(), second.policy());
     }
 
     #[test]
@@ -855,6 +858,7 @@ mod tests {
         assert_eq!(runtime.provider_name(), "host");
         assert!(runtime.storage_root().ends_with("sandbox"));
         assert!(runtime.support().available);
+        assert_eq!(runtime.to_string(), "Sandbox Provider: host");
 
         let error = match SandboxRuntime::from_provider_name(
             Some("invalid"),
@@ -1129,5 +1133,64 @@ mod tests {
         assert_eq!(provider.shutdowns.lock().len(), 2);
         assert!(!primary_root.exists());
         assert!(!secondary_root.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_all_active_cells() {
+        let temp = tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingProvider::default());
+        let runtime =
+            SandboxRuntime::new("recording", provider.clone(), temp.path().join("sandbox"))
+                .expect("runtime");
+        let key = SandboxCellKey::tooling(Uuid::new_v4(), "agent");
+        let root = runtime.managed_cell_root(&key).expect("managed root");
+        let _lease = runtime
+            .lease_cell(SandboxCellSpec::managed_component(
+                key,
+                root,
+                SandboxMode::ReadOnly,
+                SandboxPolicy::default(),
+            ))
+            .await
+            .expect("lease");
+
+        runtime.shutdown();
+
+        assert_eq!(provider.shutdowns.lock().len(), 1);
+    }
+
+    #[test]
+    fn ensure_child_directory_and_remove_directory_tree_reject_existing_files() {
+        let temp = tempdir().expect("tempdir");
+        let parent = temp.path().join("parent");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let file = parent.join("file.txt");
+        std::fs::write(&file, "data").expect("write file");
+
+        let create_error = ensure_child_directory(&parent, "file.txt")
+            .expect_err("existing file should be rejected");
+        assert!(create_error.to_string().contains("must be a directory"));
+
+        let remove_error =
+            remove_directory_tree_if_safe(&file).expect_err("file path should be rejected");
+        assert!(remove_error.to_string().contains("must be a directory"));
+    }
+
+    #[test]
+    fn remove_directory_tree_if_safe_ignores_missing_paths() {
+        let temp = tempdir().expect("tempdir");
+
+        remove_directory_tree_if_safe(&temp.path().join("missing"))
+            .expect("missing path should be ignored");
+    }
+
+    #[test]
+    fn sanitize_segment_truncates_long_values_without_trailing_underscores() {
+        let sanitized =
+            sanitize_segment("long-segment-with/unsafe.characters________________________________");
+
+        assert!(sanitized.len() <= 45);
+        assert!(!sanitized.ends_with('_'));
+        assert!(sanitized.contains('-'));
     }
 }
